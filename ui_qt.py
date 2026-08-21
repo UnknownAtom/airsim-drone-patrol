@@ -443,18 +443,29 @@ class DetectionDisplay(PilDetectionDisplay):
         self.round_label.setText(f"第 {round_no} 圈")
         self.route_widget.set_progress(total, index)
 
-        if self.last_snapshot is not None and self.last_snapshot.boxes:
-            target = self.last_snapshot.boxes[0]
-            name = _display_name(target[6])
-            confidence = float(target[5])
-            color = "warning" if confidence < 0.45 else "primary"
-            self.target_label.setText(f"{name}  {confidence:.0%}")
+        boxes = self.last_snapshot.boxes if self.last_snapshot is not None else ()
+        if boxes:
+            # 显示全部检测目标：按置信度降序，逐行着色
+            ordered = sorted(boxes, key=lambda box: float(box[5]), reverse=True)
+            lines = []
+            for box in ordered:
+                name = _display_name(box[6])
+                confidence = float(box[5])
+                color = "warning" if confidence < 0.45 else "primary"
+                lines.append(
+                    f'<span style="color:{_hex(color)}; font-size:15px; font-weight:600;">'
+                    f"{name}  {confidence:.0%}</span>"
+                )
+            self.target_label.setText("<br>".join(lines))
+            self.target_label.setTextFormat(Qt.TextFormat.RichText)
+            self.target_label.setWordWrap(True)
             self.target_label.setStyleSheet(
                 f"background: {_hex('soft_gray')}; border-radius: 10px; padding: 12px;"
-                f" color: {_hex(color)}; font-size: 16px; font-weight: 600;"
             )
         else:
             self.target_label.setText("当前画面没有检测目标")
+            self.target_label.setTextFormat(Qt.TextFormat.PlainText)
+            self.target_label.setWordWrap(False)
             self.target_label.setStyleSheet(
                 f"background: {_hex('soft_gray')}; border-radius: 10px; padding: 12px;"
                 f" color: {_hex('muted_light')};"

@@ -265,6 +265,34 @@ def safe_cancel(client: airsim.MultirotorClient) -> None:
         pass
 
 
+def _wait_for_connection(
+    client: airsim.MultirotorClient,
+    stop_event: threading.Event,
+    ui: dict[str, Any],
+    state_lock: threading.Lock,
+) -> bool:
+    """等待 AirSim 就绪；未启动时保持运行，不自动退出。
+
+    连接期间界面显示“等待 AirSim 信号”；按 Q 可退出。连接成功返回 True，
+    被停止返回 False。
+    """
+    delay = 1.0
+    print("[FLIGHT] 等待 AirSim 连接…（未检测到 AirSim 信号）")
+    ui["messages"].push("info", "等待 AirSim 信号，请启动模拟器…")
+    with state_lock:
+        ui["airsim_connected"] = False
+    while not stop_event.is_set():
+        try:
+            client.ping()
+            return True
+        except Exception:
+            with state_lock:
+                ui["airsim_connected"] = False
+            time.sleep(delay)
+            delay = min(delay * 2, 10.0)
+    return False
+
+
 def flight_worker(
     *,
     args: argparse.Namespace,
@@ -278,7 +306,10 @@ def flight_worker(
     client = airsim.MultirotorClient()
     api_control = False
     try:
-        client.confirmConnection()
+        if not _wait_for_connection(client, stop_event, ui, state_lock):
+            return  # 用户在连接等待期间按 Q 退出
+        with state_lock:
+            ui["airsim_connected"] = True
         client.reset()
         time.sleep(1.0)
         client.enableApiControl(True)

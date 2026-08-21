@@ -189,6 +189,7 @@ def main() -> None:
         "frames_captured": 0,
         "detections": 0,
         "camera_ok": False,
+        "airsim_connected": False,
         "source_size": (0, 0),
         "fps": 0.0,
         "messages": UIMessages(),

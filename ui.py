@@ -562,6 +562,8 @@ class DetectionDisplay:
         camera_ok = bool(ui.get("camera_ok"))
         detections = int(ui.get("detections", 0))
         waypoint = int(ui.get("waypoint_index", 0))
+        if not ui.get("airsim_connected", False):
+            return "等待 AirSim 信号", "muted", "未检测到 AirSim 模拟器，请先启动场景"
         if not camera_ok:
             return "待命", "muted", "等待相机连接"
         if detections > 0:

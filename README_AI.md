@@ -81,7 +81,7 @@ cd <项目目录>
 python -m pip install -r requirements.txt
 ```
 
-启动前必须先打开 AirSim 场景，并确认 AirSim RPC 服务可连接。默认启动命令：
+AirSim 未启动时脚本依然可以正常启动：飞行线程会持续等待连接并显示“等待 AirSim 信号”，按 Q 可退出；启动场景后自动接管继续任务。默认启动命令：
 
 ```powershell
 cd <项目目录>
