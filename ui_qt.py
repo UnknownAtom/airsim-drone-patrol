@@ -395,7 +395,7 @@ class _PilRenderer:
         )
         self._text(draw, (inner[0] + 37, inner[1] + 19), hud_text, "small", "primary")
 
-        if self.last_snapshot is not None:
+        if self.last_snapshot is not None and ui.get("show_detections", True):
             for xmin, ymin, xmax, ymax, _class_id, confidence, name in self.last_snapshot.boxes:
                 accent = "primary" if confidence >= 0.45 else "warning"
                 left = _clip(px + xmin * scale, image_box[0], image_box[2])
@@ -436,6 +436,8 @@ class _PilRenderer:
             return "等待 AirSim 信号", "muted", "未检测到 AirSim 模拟器，请先启动场景"
         if not ui.get("airsim_ready", False):
             return "等待场景就绪", "muted", "AirSim 已连接，场景加载中…"
+        if not ui.get("cruise_started", False):
+            return "● 任务待命", "primary", "点击“多航点巡航”开始任务"
         if not camera_ok:
             return "待命", "muted", "等待相机连接"
         if detections > 0:
@@ -704,13 +706,13 @@ class DetectionDisplay(_PilRenderer):
 
         panel.addStretch(1)
 
-        # 操作按钮
+        # 操作按钮（绑定真实控制：巡航启停 / 检测框显示开关）
         self.btn_cruise = self._make_button("多航点巡航")
         self.btn_detect = self._make_button("实时视觉检测")
-        self.btn_stop = self._make_button("按 Q 键停止任务", danger=True)
+        self.btn_stop = self._make_button("停止任务", danger=True)
         self.btn_cruise.clicked.connect(self._on_cruise_clicked)
-        self.btn_detect.clicked.connect(lambda: self._on_action("detect"))
-        self.btn_stop.clicked.connect(self._request_quit)
+        self.btn_detect.clicked.connect(self._on_detect_clicked)
+        self.btn_stop.clicked.connect(self._on_stop_clicked)
         panel.addWidget(self.btn_cruise)
         panel.addWidget(self.btn_detect)
         panel.addWidget(self.btn_stop)
@@ -753,31 +755,48 @@ class DetectionDisplay(_PilRenderer):
     def _request_quit(self) -> None:
         self._quit_requested = True
 
-    def _on_cruise_clicked(self) -> None:
-        """“多航点巡航”按钮：反馈当前巡航状态。"""
-        ui = self._cruise_ui
-        if ui is None:
-            return
-        if ui.get("cruise_started", False):
-            text = "巡航进行中"
-        elif ui.get("airsim_connected", False):
-            text = "场景加载完成后自动开始巡航"
-        else:
-            text = "正在等待 AirSim 信号，请启动模拟器"
-        print(f"[UI] 巡航按钮: {text}")
+    def _push_message(self, ui: dict[str, Any], text: str) -> None:
+        print(f"[UI] {text}")
         messages = ui.get("messages")
         if messages is not None:
             messages.push("info", text)
 
-    def _on_action(self, action: str) -> None:
-        """其他操作按钮的反馈（预留功能接口）。"""
-        print(f"[UI] 按钮动作: {action}")
+    def _on_cruise_clicked(self) -> None:
+        """“多航点巡航”：触发巡航开始（停止后可重新开始）。"""
         ui = self._cruise_ui
         if ui is None:
             return
-        messages = ui.get("messages")
-        if messages is not None:
-            messages.push("info", "实时视觉检测运行中")
+        if ui.get("cruise_started", False):
+            self._push_message(ui, "巡航进行中")
+            return
+        if not ui.get("airsim_connected", False):
+            self._push_message(ui, "正在等待 AirSim 信号，请启动模拟器")
+            return
+        ui["start_cruise"].set()
+        if ui.get("airsim_ready", False):
+            self._push_message(ui, "已发送开始指令，即将起飞")
+        else:
+            self._push_message(ui, "场景加载完成后自动开始巡航")
+
+    def _on_stop_clicked(self) -> None:
+        """“停止任务”：停止巡航并降落（程序保持运行）。"""
+        ui = self._cruise_ui
+        if ui is None:
+            return
+        if not ui.get("cruise_started", False):
+            self._push_message(ui, "任务未在运行")
+            return
+        ui["stop_cruise"].set()
+        self._push_message(ui, "正在停止巡航并降落…")
+
+    def _on_detect_clicked(self) -> None:
+        """“实时视觉检测”：切换检测框显示。"""
+        ui = self._cruise_ui
+        if ui is None:
+            return
+        show = not ui.get("show_detections", True)
+        ui["show_detections"] = show
+        self._push_message(ui, f"检测框显示已{'开启' if show else '关闭'}")
 
     # ------------------------------------------------------------------
     # 对外接口（与旧 ui.py 语义一致）

@@ -190,6 +190,10 @@ def fly_to_leg(
         if stop_event.is_set():
             client.cancelLastTask()
             return
+        if ui["stop_cruise"].is_set():
+            # “停止任务”按钮：提前结束当前航段
+            client.cancelLastTask()
+            return
         if monitor is not None:
             message = monitor.check()
             if message:
@@ -320,6 +324,28 @@ def _wait_for_ready(
     return False
 
 
+def _takeoff(
+    client: airsim.MultirotorClient,
+    args: argparse.Namespace,
+    ui: dict[str, Any],
+    state_lock: threading.Lock,
+) -> None:
+    """起飞并爬升至巡航高度（首次与“重新开始”复用）。"""
+    client.armDisarm(True)
+    print("正在起飞无人机...")
+    ui["messages"].push("info", "正在起飞…")
+    try:
+        client.takeoffAsync(timeout_sec=30).join()
+    except Exception as exc:
+        raise RuntimeError(f"起飞失败（30 秒超时或 RPC 错误）: {exc}") from exc
+    try:
+        client.moveToZAsync(args.takeoff_z, 2.0).join()
+    except Exception as exc:
+        raise RuntimeError(f"爬升至巡航高度失败: {exc}") from exc
+    with state_lock:
+        ui["cruise_started"] = True
+
+
 def flight_worker(
     *,
     args: argparse.Namespace,
@@ -329,7 +355,11 @@ def flight_worker(
     state_lock: threading.Lock,
     result: dict[str, Any],
 ) -> None:
-    """Own all AirSim RPC calls so the GUI thread can never block on AirSim."""
+    """Own all AirSim RPC calls so the GUI thread can never block on AirSim.
+
+    任务循环：首次连接/就绪后自动起飞巡航；巡航可被“停止任务”按钮
+    中断（降落并回到待命），再点“多航点巡航”可重新开始；Q 键完全退出。
+    """
     client = airsim.MultirotorClient()
     api_control = False
     try:
@@ -343,49 +373,77 @@ def flight_worker(
         time.sleep(1.0)
         client.enableApiControl(True)
         api_control = True
-        client.armDisarm(True)
-        print("正在起飞无人机...")
-        ui["messages"].push("info", "正在起飞…")
-        try:
-            client.takeoffAsync(timeout_sec=30).join()
-        except Exception as exc:
-            raise RuntimeError(f"起飞失败（30 秒超时或 RPC 错误）: {exc}") from exc
-        try:
-            client.moveToZAsync(args.takeoff_z, 2.0).join()
-        except Exception as exc:
-            raise RuntimeError(f"爬升至巡航高度失败: {exc}") from exc
 
-        print(f"巡航高度：{-args.takeoff_z:g} m；最大速度：{args.max_speed:g} m/s")
-        print(f"开始巡航：{len(result['waypoints'])} 个航点，按 Q 键停止。")
-        with state_lock:
-            ui["cruise_started"] = True
-        ui["messages"].push("info", f"起飞完成，开始巡航（{len(result['waypoints'])} 个航点）")
         monitor = CollisionMonitor(client, grace_seconds=args.collision_grace)
-        patrol_round = 0
-        while (args.loops == 0 or patrol_round < args.loops) and not stop_event.is_set():
-            patrol_round += 1
-            for waypoint_index, waypoint in enumerate(result["waypoints"], start=1):
+        first_run = True
+        while not stop_event.is_set():
+            # 等待开始指令：首次自动开始；停止后等待“多航点巡航”按钮
+            if not first_run:
+                print("[FLIGHT] 任务待命：点击“多航点巡航”开始巡航")
+                ui["messages"].push("info", "任务待命：点击“多航点巡航”开始巡航")
+                while not ui["start_cruise"].wait(0.2) and not stop_event.is_set():
+                    pass
+                ui["start_cruise"].clear()
                 if stop_event.is_set():
                     break
-                with state_lock:
-                    ui["patrol_round"] = patrol_round
-                    ui["waypoint_index"] = waypoint_index
-                print(
-                    f"[FLIGHT] 第 {patrol_round} 圈 / 航点 {waypoint_index}: "
-                    f"({waypoint.x:g}, {waypoint.y:g}, {waypoint.z:g})"
-                )
-                fly_to_waypoint(
-                    client=client,
-                    waypoint=waypoint,
-                    stop_event=stop_event,
-                    args=args,
-                    patrol_round=patrol_round,
-                    waypoint_index=waypoint_index,
-                    started_monotonic=result["started_monotonic"],
-                    monitor=monitor,
-                    ui=ui,
-                    state_lock=state_lock,
-                )
+            first_run = False
+
+            _takeoff(client, args, ui, state_lock)
+            print(f"巡航高度：{-args.takeoff_z:g} m；最大速度：{args.max_speed:g} m/s")
+            print(f"开始巡航：{len(result['waypoints'])} 个航点（“停止任务”按钮或 Q 可停止）")
+            ui["messages"].push("info", f"起飞完成，开始巡航（{len(result['waypoints'])} 个航点）")
+
+            patrol_round = 0
+            cruise_aborted = False
+            while (args.loops == 0 or patrol_round < args.loops) and not stop_event.is_set():
+                patrol_round += 1
+                for waypoint_index, waypoint in enumerate(result["waypoints"], start=1):
+                    if stop_event.is_set():
+                        cruise_aborted = True
+                        break
+                    if ui["stop_cruise"].is_set():
+                        ui["stop_cruise"].clear()
+                        cruise_aborted = True
+                        print("[FLIGHT] 收到停止指令，正在降落…")
+                        ui["messages"].push("info", "收到停止指令，正在降落…")
+                        break
+                    with state_lock:
+                        ui["patrol_round"] = patrol_round
+                        ui["waypoint_index"] = waypoint_index
+                    print(
+                        f"[FLIGHT] 第 {patrol_round} 圈 / 航点 {waypoint_index}: "
+                        f"({waypoint.x:g}, {waypoint.y:g}, {waypoint.z:g})"
+                    )
+                    fly_to_waypoint(
+                        client=client,
+                        waypoint=waypoint,
+                        stop_event=stop_event,
+                        args=args,
+                        patrol_round=patrol_round,
+                        waypoint_index=waypoint_index,
+                        started_monotonic=result["started_monotonic"],
+                        monitor=monitor,
+                        ui=ui,
+                        state_lock=state_lock,
+                    )
+                if cruise_aborted:
+                    break
+
+            # 本次巡航结束：降落，回到待命
+            safe_cancel(client)
+            try:
+                client.landAsync().join()
+            except Exception as exc:
+                print(f"降落过程中出现问题：{exc}")
+            try:
+                client.armDisarm(False)
+            except Exception:
+                pass
+            with state_lock:
+                ui["cruise_started"] = False
+            if not stop_event.is_set():
+                print("[FLIGHT] 巡航结束，已降落；等待“多航点巡航”重新开始")
+                ui["messages"].push("info", "巡航结束，已降落")
     except Exception as exc:
         result["error"] = exc
         print(f"[FLIGHT] 巡航线程出错，准备降落: {type(exc).__name__}: {exc}")
