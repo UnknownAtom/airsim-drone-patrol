@@ -16,7 +16,7 @@
 
 ## 2. 当前运行状态
 
-当前主程序是 `simu.py`。它已经包含：
+当前主程序是 `simu.py`（组装入口）。飞行/取图/检测逻辑分别在 `flight.py`、`capture.py`、`detector.py` 中，界面在 `ui.py`。整体包含：
 
 - AirSim 多航点巡航；
 - 起飞、爬升、航点移动、悬停和降落；
@@ -279,7 +279,7 @@ python simu.py --device 0 --save-every 30
 推荐的最小验证：
 
 ```powershell
-python -m py_compile simu.py
+python -m py_compile simu.py flight.py capture.py detector.py ui.py
 ```
 
 如果改动涉及完整依赖，再运行：
@@ -297,10 +297,9 @@ CSV/Excel 自动导出已经按用户要求暂时砍掉。`requirements.txt` 中
 
 其他可扩展方向：
 
-- 在 GUI 中增加当前航点、速度和碰撞状态；
+- 在 GUI 中增加碰撞状态显示；
 - 增加相机姿态和 FOV 的可视化配置；
 - 为 CityEnviron 单独规划安全航线；
 - 增加视频录制或按事件保存图像；
-- 对 VisDrone 类别进行中文显示映射。
 
-扩展前先确认不会破坏当前已经验证的实时取图和三线程结构。
+扩展前先确认不会破坏当前已经验证的实时取图和四线程结构。
