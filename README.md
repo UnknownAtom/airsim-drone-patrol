@@ -39,6 +39,8 @@ python simu.py --device 0
 
 按 `Q` 键安全停止：程序会取消移动任务、降落、解除解锁并打印运行摘要。
 
+连接异常时，程序会在后台持续重试，并在界面中显示具体 RPC 错误。AirSimNH 和 CityEnviron 不要同时使用默认的 `41451` 端口；运行目标场景时只保留一个仿真器，或为不同场景配置不同端口。
+
 ## 常用参数
 
 | 参数 | 默认值 | 说明 |
@@ -52,6 +54,8 @@ python simu.py --device 0
 | `--max-speed` | `2.0` | 速度上限（m/s） |
 | `--save-every N` | `0` | 每 N 帧保存一张原始帧到 `captures/` |
 | `--debug` | 关闭 | 输出帧号与航点诊断信息 |
+| `--airsim-ip` / `--airsim-port` | `127.0.0.1` / `41451` | AirSim RPC 地址与端口 |
+| `--airsim-timeout` | `5` | 单次 AirSim RPC 超时时间（秒） |
 
 ## 项目结构
 

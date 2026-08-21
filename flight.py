@@ -262,54 +262,98 @@ def fly_to_waypoint(
         )
 
 
-def safe_cancel(client: airsim.MultirotorClient) -> None:
+def _close_client(client: airsim.MultirotorClient | None) -> None:
+    """Close the underlying msgpack session after a failed RPC attempt."""
+    if client is None:
+        return
+    try:
+        client.client.close()
+    except Exception:
+        pass
+
+
+def safe_cancel(client: airsim.MultirotorClient | None) -> None:
+    if client is None:
+        return
     try:
         client.cancelLastTask()
     except Exception:
         pass
 
 
+def _new_client(args: argparse.Namespace) -> airsim.MultirotorClient:
+    return airsim.MultirotorClient(
+        ip=args.airsim_ip,
+        port=args.airsim_port,
+        timeout_value=args.airsim_timeout,
+    )
+
+
 def _wait_for_connection(
-    client: airsim.MultirotorClient,
+    args: argparse.Namespace,
     stop_event: threading.Event,
     ui: dict[str, Any],
     state_lock: threading.Lock,
-) -> bool:
+) -> airsim.MultirotorClient | None:
     """等待 AirSim 就绪；未启动时保持运行，不自动退出。
 
-    连接期间界面显示“等待 AirSim 信号”；按 Q 可退出。连接成功返回 True，
-    被停止返回 False。
+    连接期间界面显示“等待 AirSim 信号”；按 Q 可退出。连接成功返回新的
+    AirSim 客户端，被停止返回 None。
     """
     delay = 1.0
-    print("[FLIGHT] 等待 AirSim 连接…（未检测到 AirSim 信号）")
+    endpoint = f"{args.airsim_ip}:{args.airsim_port}"
+    last_error = ""
+    print(f"[FLIGHT] 等待 AirSim 连接…（{endpoint}）")
     ui["messages"].push("info", "等待 AirSim 信号，请启动模拟器…")
     with state_lock:
         ui["airsim_connected"] = False
+        ui["airsim_ready"] = False
+        ui["airsim_error"] = ""
     while not stop_event.is_set():
+        candidate: airsim.MultirotorClient | None = None
         try:
-            client.ping()
-            return True
-        except Exception:
+            # A timed-out msgpack client may retain a broken session. Create a
+            # fresh client for every attempt instead of reusing that session.
+            candidate = _new_client(args)
+            if not candidate.ping():
+                raise ConnectionError("AirSim ping returned false")
+            with state_lock:
+                ui["airsim_connected"] = True
+                ui["airsim_error"] = ""
+            print(f"[FLIGHT] AirSim RPC 已连接：{endpoint}")
+            return candidate
+        except Exception as exc:
+            _close_client(candidate)
+            error_text = f"{type(exc).__name__}: {exc}"
             with state_lock:
                 ui["airsim_connected"] = False
-            time.sleep(delay)
+                ui["airsim_ready"] = False
+                ui["airsim_error"] = error_text
+            if error_text != last_error:
+                last_error = error_text
+                print(f"[FLIGHT] AirSim RPC 连接失败（{endpoint}）：{error_text}")
+            if stop_event.wait(delay):
+                break
             delay = min(delay * 2, 10.0)
-    return False
+    return None
 
 
 def _wait_for_ready(
     client: airsim.MultirotorClient,
+    args: argparse.Namespace,
     stop_event: threading.Event,
     ui: dict[str, Any],
     state_lock: threading.Lock,
-) -> bool:
+) -> airsim.MultirotorClient | None:
     """等待 AirSim 场景加载完成（RPC 通了但场景可能还在加载）。
 
     ``getMultirotorState`` 能返回有效位置即视为就绪；期间界面显示
-    “等待场景就绪”，按 Q 可退出。就绪返回 True，被停止返回 False。
+    “等待场景就绪”，按 Q 可退出。就绪返回客户端，被停止返回 None。
     """
+    endpoint = f"{args.airsim_ip}:{args.airsim_port}"
     print("[FLIGHT] AirSim 已连接，等待场景就绪…")
     ui["messages"].push("info", "AirSim 已连接，等待场景加载…")
+    last_error = ""
     while not stop_event.is_set():
         try:
             state = client.getMultirotorState()
@@ -317,11 +361,29 @@ def _wait_for_ready(
             if position is not None:
                 with state_lock:
                     ui["airsim_ready"] = True
-                return True
-        except Exception:
-            pass
-        time.sleep(1.0)
-    return False
+                    ui["airsim_error"] = ""
+                print(f"[FLIGHT] AirSim 场景已就绪：{endpoint}")
+                return client
+        except Exception as exc:
+            error_text = f"{type(exc).__name__}: {exc}"
+            if error_text != last_error:
+                last_error = error_text
+                print(f"[FLIGHT] 等待场景就绪失败（{endpoint}）：{error_text}")
+            _close_client(client)
+            client = None
+            with state_lock:
+                ui["airsim_ready"] = False
+                ui["airsim_error"] = error_text
+
+            # Reconnect with a new RPC session instead of polling a client
+            # whose request already timed out.
+            client = _wait_for_connection(args, stop_event, ui, state_lock)
+            if client is None:
+                return None
+        if stop_event.wait(1.0):
+            break
+    _close_client(client)
+    return None
 
 
 def _takeoff(
@@ -360,16 +422,14 @@ def flight_worker(
     任务循环：首次连接/就绪后自动起飞巡航；巡航可被“停止任务”按钮
     中断（降落并回到待命），再点“多航点巡航”可重新开始；Q 键完全退出。
     """
-    client = airsim.MultirotorClient(timeout_value=5.0)
-    # timeout_value=5.0：默认 3600s，未连接时 ping() 会阻塞 1 小时导致
-    # “等待 AirSim 信号”永远等不到；短超时让连接检测快速失败并重试。
+    client: airsim.MultirotorClient | None = None
     api_control = False
     try:
-        if not _wait_for_connection(client, stop_event, ui, state_lock):
+        client = _wait_for_connection(args, stop_event, ui, state_lock)
+        if client is None:
             return  # 用户在连接等待期间按 Q 退出
-        with state_lock:
-            ui["airsim_connected"] = True
-        if not _wait_for_ready(client, stop_event, ui, state_lock):
+        client = _wait_for_ready(client, args, stop_event, ui, state_lock)
+        if client is None:
             return  # 用户在场景加载等待期间按 Q 退出
         client.reset()
         time.sleep(1.0)
@@ -462,5 +522,6 @@ def flight_worker(
                 client.enableApiControl(False)
             except Exception:
                 pass
+        _close_client(client)
         ui["messages"].push("info", "任务结束，已降落")
         done_event.set()

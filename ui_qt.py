@@ -433,13 +433,18 @@ class _PilRenderer:
         detections = int(ui.get("detections", 0))
         waypoint = int(ui.get("waypoint_index", 0))
         if not ui.get("airsim_connected", False):
-            return "等待 AirSim 信号", "muted", "未检测到 AirSim 模拟器，请先启动场景"
+            error = str(ui.get("airsim_error", "")).strip()
+            subtitle = "未检测到 AirSim 模拟器，请先启动场景"
+            if error:
+                subtitle = f"连接失败：{error}"
+            return "等待 AirSim 信号", "muted", subtitle
         if not ui.get("airsim_ready", False):
             return "等待场景就绪", "muted", "AirSim 已连接，场景加载中…"
         if not ui.get("cruise_started", False):
             return "● 任务待命", "primary", "点击“多航点巡航”开始任务"
         if not camera_ok:
-            return "待命", "muted", "等待相机连接"
+            camera_error = str(ui.get("camera_error", "")).strip()
+            return "待命", "muted", f"相机连接失败：{camera_error}" if camera_error else "等待相机连接"
         if detections > 0:
             return "● 发现目标", "warning", "正在进行目标检测"
         if waypoint > 0:
@@ -656,6 +661,8 @@ class DetectionDisplay(_PilRenderer):
         self.status_subtitle = QLabel("相机已连接")
         self.status_subtitle.setFont(_make_font(13))
         self.status_subtitle.setStyleSheet(f"color: {_hex('muted')};")
+        self.status_subtitle.setWordWrap(True)
+        self.status_subtitle.setMaximumHeight(42)
         panel.addWidget(self.status_title)
         panel.addWidget(self.status_subtitle)
 

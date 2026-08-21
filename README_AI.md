@@ -22,7 +22,7 @@
 - 起飞、爬升、航点移动、悬停和降落；
 - 独立相机采集线程；
 - 独立 YOLO 检测线程；
-- OpenCV 主线程显示；
+- PyQt6 GUI 主线程显示，视频画面内部使用 PIL 绘制；
 - 只保留最新帧，避免检测队列堆积造成“画面停在第一帧”；
 - AirSim 相机连接失败后的重试和重连；
 - 碰撞状态基线与起飞初期 grace period；
@@ -44,6 +44,7 @@
 | `capture.py` | 取图模块：相机连接/重连、帧采集线程、最新帧入队 |
 | `detector.py` | 检测模块：YOLO 模型加载/推理、检测线程、检测快照 |
 | `ui_qt.py` | PyQt6 前端：左侧 PIL 视频区（检测框/HUD）+ 右侧 Qt Widgets 面板（信息卡片/进度条/航点路线/按钮） |
+| `settings.json` | AirSim 用户配置，建议明确设置 `SimMode: Multirotor` 和相机分辨率 |
 | `waypoints.json` | 当前巡航航点配置 |
 | `visdrone-yolov26l.pt` | 默认主模型（Ultralytics 格式，VisDrone 10 类 + others） |
 | `yolov5s-visdrone.pt` | 旧版 YOLOv5 VisDrone 权重（备用，走 Torch Hub 加载） |
@@ -98,6 +99,14 @@ CPU 或低性能测试：
 ```powershell
 python simu.py --device cpu --imgsz 320 --poll-interval 0.2
 ```
+
+指定 AirSim RPC 端点：
+
+```powershell
+python simu.py --device 0 --airsim-ip 127.0.0.1 --airsim-port 41451 --airsim-timeout 5
+```
+
+飞行线程和相机线程共用上述 RPC 端点。每次连接失败都会新建客户端，避免复用已经超时的 msgpack 会话。连接诊断会显示在终端和右侧状态区，包括端口不可达、RPC 超时和场景尚未就绪等情况。
 
 按 `Q` 可请求安全停止。程序结束时会取消移动任务、降落、解除解锁和 API 控制，并打印运行摘要。
 
@@ -157,7 +166,35 @@ truck, tricycle, awning-tricycle, bus, motor
 
 如果源分辨率仍是 256×144，优先检查 AirSim 的 `settings.json`、相机名称和场景是否重启，不要只放大 GUI 窗口。
 
-## 7. 线程架构
+## 7. AirSim 连接规则
+
+程序默认连接 `127.0.0.1:41451`。`--airsim-ip`、`--airsim-port` 和 `--airsim-timeout` 会同时作用于飞行客户端和相机客户端。
+
+不要同时启动 AirSimNH 和 CityEnviron 并让它们都使用默认的 `41451` 端口。端口处于 LISTEN 状态不代表 AirSim RPC 已经可用；如果 `ping()` 超时，先关闭另一个仿真器并重启目标场景，再检查端口。
+
+建议在 `C:\\Users\\lenovo\\Documents\\AirSim\\settings.json` 中明确指定多旋翼模式，避免启动时弹出车辆选择对话框：
+
+```json
+{
+  "SettingsVersion": 1.2,
+  "SimMode": "Multirotor",
+  "CameraDefaults": {
+    "CaptureSettings": [
+      {"ImageType": 0, "Width": 1280, "Height": 720, "FOV_Degrees": 90}
+    ]
+  }
+}
+```
+
+如果界面持续显示“等待 AirSim 信号”，先用同一 Python 环境执行：
+
+```powershell
+python -c "import airsim; c=airsim.MultirotorClient(ip='127.0.0.1', port=41451, timeout_value=5); print(c.ping())"
+```
+
+如果这个探测也出现 `TimeoutError`，问题在 AirSim RPC 服务或端口冲突，不在 YOLO 和 GUI。
+
+## 8. 线程架构
 
 当前程序必须保持以下职责分离：
 
@@ -171,15 +208,15 @@ AirSim 相机线程
 YOLO 检测线程
     └─ 取最新帧 → 推理 → 最新检测结果
 
-GUI 主线程
-    └─ 取最新显示帧 → 绘制 → cv2.imshow / waitKey
+PyQt6 GUI 主线程
+    └─ 取最新显示帧 → PIL 绘制 → QLabel / QApplication.processEvents
 ```
 
 队列大小刻意设为 1，并且新帧会覆盖旧帧。这是为了降低延迟：实时画面宁可丢弃旧帧，也不能让检测线程处理几秒前的画面。
 
 禁止把 `simGetImages()`、YOLO 推理或 AirSim RPC 长调用重新放进 GUI 主线程，否则窗口可能再次卡死。也不要在到达航点后直接对一个尚未结束的移动任务调用阻塞式 `hoverAsync().join()`；当前实现会先 `cancelLastTask()`。
 
-## 8. 航点和坐标规则
+## 9. 航点和坐标规则
 
 AirSim 使用 NED 坐标系：
 
@@ -215,7 +252,7 @@ AirSim 使用 NED 坐标系：
 
 程序会将航点高度限制为不低于 `--cruise-z` 的安全高度，并将速度限制为 `--max-speed`。默认巡航高度为 `-15`，最大速度为 `2.0 m/s`。
 
-## 9. 常用参数
+## 10. 常用参数
 
 | 参数 | 默认值 | 说明 |
 |---|---:|---|
@@ -241,7 +278,7 @@ python simu.py --device 0 --save-every 30
 
 保存的文件位于 `captures/`。该功能只是原始帧排查，不是 CSV/Excel 导出。
 
-## 10. 排查顺序
+## 11. 排查顺序
 
 遇到“只有第一帧”“窗口卡死”时，按下面顺序检查：
 
@@ -261,7 +298,7 @@ python simu.py --device 0 --save-every 30
 
 遇到“撞墙”时，先减小速度、提高高度、缩短航点间距并检查路线，不要通过取消碰撞监控来掩盖路线问题。默认发生新碰撞后会停止；只有用户明确要求时才使用 `--continue-after-collision`。
 
-## 11. AI 修改代码的硬性规则
+## 12. AI 修改代码的硬性规则
 
 任何代码修改都应遵守：
 
@@ -289,7 +326,7 @@ python -m pip install -r requirements.txt
 python simu.py --device 0 --debug
 ```
 
-## 12. 暂停使用的功能与后续方向
+## 13. 暂停使用的功能与后续方向
 
 CSV/Excel 自动导出已经按用户要求暂时砍掉。`requirements.txt` 中仍保留 `pandas` 和 `openpyxl`，它们是历史依赖，不能据此判断导出功能已经启用。
 

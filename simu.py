@@ -61,6 +61,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--imgsz", type=int, default=640, help="YOLO inference size; camera can remain HD")
     parser.add_argument("--camera", default="0", help="AirSim camera name")
     parser.add_argument(
+        "--airsim-ip",
+        "--ip",
+        dest="airsim_ip",
+        default="127.0.0.1",
+        help="AirSim RPC server address",
+    )
+    parser.add_argument(
+        "--airsim-port",
+        "--port",
+        dest="airsim_port",
+        type=int,
+        default=41451,
+        help="AirSim RPC server port",
+    )
+    parser.add_argument(
+        "--airsim-timeout",
+        type=float,
+        default=5.0,
+        help="AirSim RPC call timeout in seconds",
+    )
+    parser.add_argument(
         "--waypoints-file",
         default=str(DEFAULT_WAYPOINT_FILE),
         help="JSON file containing waypoint objects",
@@ -107,7 +128,7 @@ def parse_args() -> argparse.Namespace:
         default=5.0,
         help="Seconds after flight start during which collisions are ignored (spawn/reset artifacts)",
     )
-    parser.add_argument("--no-display", action="store_true", help="Disable the OpenCV visualization window")
+    parser.add_argument("--no-display", action="store_true", help="Disable the PyQt6 visualization window")
     parser.add_argument("--display-width", type=int, default=1600)
     parser.add_argument("--display-height", type=int, default=900)
     parser.add_argument(
@@ -188,8 +209,11 @@ def main() -> None:
         "frames_captured": 0,
         "detections": 0,
         "camera_ok": False,
+        "camera_error": "",
         "airsim_connected": False,
         "airsim_ready": False,
+        "airsim_endpoint": f"{args.airsim_ip}:{args.airsim_port}",
+        "airsim_error": "",
         "cruise_started": False,
         "show_detections": True,
         "start_cruise": threading.Event(),

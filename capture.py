@@ -110,17 +110,38 @@ class CaptureWorker:
     def _connect(self) -> airsim.MultirotorClient | None:
         delay = 1.0
         while not self.stop_event.is_set():
+            camera_client = None
             try:
-                # timeout_value=5.0：默认 3600s，未连接时 confirmConnection
-                # 会阻塞 1 小时；短超时让重连循环快速失败并重试。
-                camera_client = airsim.MultirotorClient(timeout_value=5.0)
+                camera_client = airsim.MultirotorClient(
+                    ip=self.args.airsim_ip,
+                    port=self.args.airsim_port,
+                    timeout_value=self.args.airsim_timeout,
+                )
                 camera_client.confirmConnection()
-                print("[CAMERA] 相机线程已连接")
+                with self.state_lock:
+                    self.ui["camera_error"] = ""
+                print(
+                    f"[CAMERA] 相机线程已连接："
+                    f"{self.args.airsim_ip}:{self.args.airsim_port}"
+                )
                 return camera_client
             except Exception as exc:
+                if camera_client is not None:
+                    try:
+                        camera_client.client.close()
+                    except Exception:
+                        pass
                 self.error = exc
-                print(f"[CAMERA] 连接 AirSim 失败，{delay:g}s 后重试: {exc}")
-                time.sleep(delay)
+                error_text = f"{type(exc).__name__}: {exc}"
+                with self.state_lock:
+                    self.ui["camera_error"] = error_text
+                print(
+                    f"[CAMERA] 连接 AirSim 失败 "
+                    f"({self.args.airsim_ip}:{self.args.airsim_port})，"
+                    f"{delay:g}s 后重试: {error_text}"
+                )
+                if self.stop_event.wait(delay):
+                    break
                 delay = min(delay * 2, 10.0)
         return None
 
@@ -157,6 +178,7 @@ class CaptureWorker:
                     waypoint_index = self.ui["waypoint_index"]
                     self.ui["frames_captured"] = self.frames_captured
                     self.ui["camera_ok"] = True
+                    self.ui["camera_error"] = ""
                     self.ui["source_size"] = (int(frame.shape[1]), int(frame.shape[0]))
 
                 frame_id = self.detector.submit(
