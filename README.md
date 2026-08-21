@@ -15,7 +15,7 @@ simu.py
  ├── flight.py   飞行模块：航点/碰撞监控/飞行线程
  ├── capture.py  取图模块：相机连接重连/帧采集线程
  ├── detector.py 检测模块：模型加载/推理/检测线程
- └── ui.py   界面模块：风格可视化控制台
+ └── ui_qt.py   界面模块：PyQt6 前端（左视频 PIL + 右面板 Widgets）
 ```
 
 ## 环境
@@ -60,7 +60,7 @@ simu.py              组装入口
 flight.py            航点/碰撞/飞行线程
 capture.py           相机/取图线程
 detector.py          YOLO 加载/推理/检测线程
-ui.py                 SCD 风格界面
+ui_qt.py              PyQt6 界面（ui.py 为原纯 PIL 版）
 waypoints.json       巡航航点
 settings_airsimnh_hd.json  1280×720 相机配置示例
 README_AI.md         面向 AI 助手的详细项目说明

@@ -7,3 +7,4 @@ numpy
 pillow
 pandas
 openpyxl
+PyQt6

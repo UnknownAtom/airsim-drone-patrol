@@ -9,7 +9,8 @@ Module layout (split from a single script; behavior unchanged):
 - ``flight.py``: waypoints, collision monitor and the flight thread;
 - ``capture.py``: camera connection/retry and the capture thread;
 - ``detector.py``: YOLO model loading, inference and the detection thread;
-- ``ui.py``: SCD-style visual frontend (unchanged).
+- ``ui_qt.py``: PyQt6 前端（左侧 PIL 视频区 + 右侧 Qt Widgets 面板）;
+- ``ui.py``: 原纯 PIL 前端（保留，接口兼容）。
 
 Robustness design (differences from earlier versions that "took off then
 landed immediately and showed no camera images"):
@@ -44,7 +45,7 @@ import cv2
 from capture import CaptureWorker, FramePacket
 from detector import DetectorBackend, DetectionWorker
 from flight import flight_worker, load_waypoints, normalize_waypoints
-from ui import DetectionDisplay, UIMessages, WINDOW_NAME, fix_window_title
+from ui_qt import DetectionDisplay, UIMessages
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_MODEL = BASE_DIR / "visdrone-yolov26l.pt"
@@ -212,16 +213,9 @@ def main() -> None:
     )
 
     if not args.no_display:
-        # Register the window with a pure-ASCII name: HighGUI mishandles
-        # non-ASCII names on zh-CN Windows and can spawn extra windows with
-        # mojibake / "\\uXXXX" titles.  Paint the empty-state console first so
-        # the window is never a blank gray box, then apply the Chinese title
-        # through the Win32 API (imshow keeps using the ASCII name, so all
-        # frames go into this single window).
-        cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(WINDOW_NAME, args.display_width, args.display_height)
+        # Qt 窗口在首次 show() 时创建并显示；先渲染一次空状态画面，
+        # 避免窗口是空白灰框。
         display.show(None, None, args, ui)
-        fix_window_title()
 
     capture_worker = CaptureWorker(
         detector=detector,
@@ -303,10 +297,8 @@ def main() -> None:
         while worker.is_alive() and time.monotonic() < shutdown_deadline:
             worker.join(timeout=0.1)
             if not args.no_display:
-                cv2.waitKey(1)
+                display.process_events()
         capture_worker.close()
-        if not args.no_display:
-            cv2.destroyAllWindows()
 
         detector.close()
         print_summary(
