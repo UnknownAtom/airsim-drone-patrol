@@ -434,6 +434,8 @@ class _PilRenderer:
         waypoint = int(ui.get("waypoint_index", 0))
         if not ui.get("airsim_connected", False):
             return "等待 AirSim 信号", "muted", "未检测到 AirSim 模拟器，请先启动场景"
+        if not ui.get("airsim_ready", False):
+            return "等待场景就绪", "muted", "AirSim 已连接，场景加载中…"
         if not camera_ok:
             return "待命", "muted", "等待相机连接"
         if detections > 0:
@@ -702,21 +704,17 @@ class DetectionDisplay(_PilRenderer):
 
         panel.addStretch(1)
 
-        # 操作按钮（预留 clicked 信号，后续可绑定实际功能）
+        # 操作按钮
         self.btn_cruise = self._make_button("多航点巡航")
         self.btn_detect = self._make_button("实时视觉检测")
         self.btn_stop = self._make_button("按 Q 键停止任务", danger=True)
-        self.btn_cruise.clicked.connect(lambda: self._on_action("cruise"))
+        self.btn_cruise.clicked.connect(self._on_cruise_clicked)
         self.btn_detect.clicked.connect(lambda: self._on_action("detect"))
         self.btn_stop.clicked.connect(self._request_quit)
         panel.addWidget(self.btn_cruise)
         panel.addWidget(self.btn_detect)
         panel.addWidget(self.btn_stop)
-
-        hint = QLabel("窗口操作提示：按 Q 键安全停止并降落")
-        hint.setFont(_make_font(12))
-        hint.setStyleSheet(f"color: {_hex('muted')};")
-        panel.addWidget(hint)
+        self._cruise_ui = None
 
     def _make_card(self) -> QLabel:
         label = QLabel("—")
@@ -755,9 +753,31 @@ class DetectionDisplay(_PilRenderer):
     def _request_quit(self) -> None:
         self._quit_requested = True
 
+    def _on_cruise_clicked(self) -> None:
+        """“多航点巡航”按钮：反馈当前巡航状态。"""
+        ui = self._cruise_ui
+        if ui is None:
+            return
+        if ui.get("cruise_started", False):
+            text = "巡航进行中"
+        elif ui.get("airsim_connected", False):
+            text = "场景加载完成后自动开始巡航"
+        else:
+            text = "正在等待 AirSim 信号，请启动模拟器"
+        print(f"[UI] 巡航按钮: {text}")
+        messages = ui.get("messages")
+        if messages is not None:
+            messages.push("info", text)
+
     def _on_action(self, action: str) -> None:
-        """操作按钮预留接口：后续在此绑定巡航/检测控制。"""
-        print(f"[UI] 按钮动作（预留）: {action}")
+        """其他操作按钮的反馈（预留功能接口）。"""
+        print(f"[UI] 按钮动作: {action}")
+        ui = self._cruise_ui
+        if ui is None:
+            return
+        messages = ui.get("messages")
+        if messages is not None:
+            messages.push("info", "实时视觉检测运行中")
 
     # ------------------------------------------------------------------
     # 对外接口（与旧 ui.py 语义一致）
@@ -765,6 +785,7 @@ class DetectionDisplay(_PilRenderer):
     def show(self, packet: Any, snapshot: Any, args: Any, ui: dict[str, Any]) -> bool:
         if args.no_display:
             return False
+        self._cruise_ui = ui
         if packet is not None:
             self.last_packet = packet
         if snapshot is not None:

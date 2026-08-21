@@ -293,6 +293,33 @@ def _wait_for_connection(
     return False
 
 
+def _wait_for_ready(
+    client: airsim.MultirotorClient,
+    stop_event: threading.Event,
+    ui: dict[str, Any],
+    state_lock: threading.Lock,
+) -> bool:
+    """等待 AirSim 场景加载完成（RPC 通了但场景可能还在加载）。
+
+    ``getMultirotorState`` 能返回有效位置即视为就绪；期间界面显示
+    “等待场景就绪”，按 Q 可退出。就绪返回 True，被停止返回 False。
+    """
+    print("[FLIGHT] AirSim 已连接，等待场景就绪…")
+    ui["messages"].push("info", "AirSim 已连接，等待场景加载…")
+    while not stop_event.is_set():
+        try:
+            state = client.getMultirotorState()
+            position = state.kinematics_estimated.position
+            if position is not None:
+                with state_lock:
+                    ui["airsim_ready"] = True
+                return True
+        except Exception:
+            pass
+        time.sleep(1.0)
+    return False
+
+
 def flight_worker(
     *,
     args: argparse.Namespace,
@@ -310,6 +337,8 @@ def flight_worker(
             return  # 用户在连接等待期间按 Q 退出
         with state_lock:
             ui["airsim_connected"] = True
+        if not _wait_for_ready(client, stop_event, ui, state_lock):
+            return  # 用户在场景加载等待期间按 Q 退出
         client.reset()
         time.sleep(1.0)
         client.enableApiControl(True)
@@ -328,6 +357,8 @@ def flight_worker(
 
         print(f"巡航高度：{-args.takeoff_z:g} m；最大速度：{args.max_speed:g} m/s")
         print(f"开始巡航：{len(result['waypoints'])} 个航点，按 Q 键停止。")
+        with state_lock:
+            ui["cruise_started"] = True
         ui["messages"].push("info", f"起飞完成，开始巡航（{len(result['waypoints'])} 个航点）")
         monitor = CollisionMonitor(client, grace_seconds=args.collision_grace)
         patrol_round = 0
