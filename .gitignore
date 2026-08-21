@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.pyc
+
+# 抓帧/日志输出
+captures/
+run_log*.txt
+
+# 大体积模型文件（保留在磁盘，不纳入版本控制）
+*.pt
+
+# 本地场景快捷方式
+*.lnk

@@ -1,0 +1,207 @@
+"""取图模块：AirSim 相机连接、帧采集与相机线程。
+
+从 simu.py 拆出的独立模块（逻辑与拆分前完全一致）：
+
+- ``get_scene_frame``：读取 Scene 相机原始帧，失败时返回错误描述；
+- ``CaptureWorker``：独立相机线程，连接失败无限重试，连续取图失败自动重连；
+- ``put_latest``：只保留最新帧的覆盖式入队。
+
+依赖 ``detector``（把帧提交给检测线程），不依赖项目内其他模块。
+"""
+
+from __future__ import annotations
+
+import argparse
+import queue
+import threading
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import airsim
+import cv2
+import numpy as np
+
+from detector import DetectionWorker
+
+
+_last_image_warning_at = 0.0
+
+
+def get_scene_frame(client: airsim.MultirotorClient, camera_name: str) -> tuple[np.ndarray | None, str | None]:
+    """Return (frame, None) on success or (None, error_description) on failure.
+
+    Failures are reported to the caller instead of being silently swallowed,
+    so the capture worker can keep a useful error for the final summary.
+    """
+    global _last_image_warning_at
+    try:
+        responses = client.simGetImages(
+            [airsim.ImageRequest(camera_name, airsim.ImageType.Scene, False, False)]
+        )
+        if not responses:
+            return None, "simGetImages 返回空列表"
+        response = responses[0]
+        payload = bytes(response.image_data_uint8 or b"")
+        if response.height <= 0 or response.width <= 0 or not payload:
+            return None, f"无效图像: h={response.height}, w={response.width}, len={len(payload)}"
+
+        expected_size = response.height * response.width * 3
+        image = np.frombuffer(payload, dtype=np.uint8)
+        if image.size < expected_size:
+            return None, f"图像数据过短: {image.size} < {expected_size}"
+        image = image[:expected_size].reshape(response.height, response.width, 3)
+
+        # Keep the raw AirSim pixel order here. This matches the user's known-
+        # working loop, which sends the reshaped Scene buffer directly to YOLO.
+        # Display resizing is handled later and does not alter the inference input.
+        return image, None
+    except Exception as exc:
+        message = f"simGetImages 异常: {type(exc).__name__}: {exc}"
+        now = time.monotonic()
+        if now - _last_image_warning_at >= 2.0:
+            _last_image_warning_at = now
+            print(f"[CAMERA] {message}")
+        return None, message
+
+
+@dataclass(frozen=True)
+class FramePacket:
+    frame: np.ndarray
+    frame_id: int
+
+
+class CaptureWorker:
+    """Continuously acquire raw AirSim frames independently of flight control.
+
+    Connection failures are retried forever instead of killing the run, and a
+    run of image failures triggers a full reconnect. This worker never touches
+    the flight's stop event, so the patrol cannot be aborted by a camera issue.
+    """
+
+    def __init__(
+        self,
+        detector: DetectionWorker,
+        frame_queue: queue.Queue[FramePacket],
+        args: argparse.Namespace,
+        stop_event: threading.Event,
+        ui: dict[str, Any],
+        state_lock: threading.Lock,
+        started_monotonic: float,
+    ) -> None:
+        self.detector = detector
+        self.frame_queue = frame_queue
+        self.args = args
+        self.stop_event = stop_event
+        self.ui = ui
+        self.state_lock = state_lock
+        self.started_monotonic = started_monotonic
+        self.error: Exception | None = None
+        self.last_image_error: str | None = None
+        self.frames_captured = 0
+        self.done_event = threading.Event()
+        self._save_warned: str | None = None
+        self.thread = threading.Thread(target=self._run, name="airsim-camera", daemon=True)
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def _connect(self) -> airsim.MultirotorClient | None:
+        delay = 1.0
+        while not self.stop_event.is_set():
+            try:
+                camera_client = airsim.MultirotorClient()
+                camera_client.confirmConnection()
+                print("[CAMERA] 相机线程已连接")
+                return camera_client
+            except Exception as exc:
+                self.error = exc
+                print(f"[CAMERA] 连接 AirSim 失败，{delay:g}s 后重试: {exc}")
+                time.sleep(delay)
+                delay = min(delay * 2, 10.0)
+        return None
+
+    def _run(self) -> None:
+        camera_client = self._connect()
+        if camera_client is None:
+            self.done_event.set()
+            return
+        consecutive_failures = 0
+        try:
+            while not self.stop_event.is_set():
+                frame, error = get_scene_frame(camera_client, self.args.camera)
+                if frame is None:
+                    consecutive_failures += 1
+                    if error:
+                        self.last_image_error = error
+                    if consecutive_failures >= 50:
+                        print("[CAMERA] 连续取图失败，尝试重新连接...")
+                        try:
+                            camera_client.close()
+                        except Exception:
+                            pass
+                        camera_client = self._connect()
+                        if camera_client is None:
+                            break
+                        consecutive_failures = 0
+                    time.sleep(max(0.02, self.args.poll_interval))
+                    continue
+
+                consecutive_failures = 0
+                self.frames_captured += 1
+                with self.state_lock:
+                    patrol_round = self.ui["patrol_round"]
+                    waypoint_index = self.ui["waypoint_index"]
+                    self.ui["frames_captured"] = self.frames_captured
+                    self.ui["camera_ok"] = True
+                    self.ui["source_size"] = (int(frame.shape[1]), int(frame.shape[0]))
+
+                frame_id = self.detector.submit(
+                    frame,
+                    patrol_round=patrol_round,
+                    waypoint_index=waypoint_index,
+                    started_monotonic=self.started_monotonic,
+                )
+                put_latest(self.frame_queue, FramePacket(frame, frame_id))
+                self._maybe_save_frame(frame, frame_id)
+                if self.args.debug and frame_id % 10 == 0:
+                    print(f"[DEBUG] capture frame_id={frame_id}")
+                time.sleep(max(0.0, self.args.poll_interval))
+        except Exception as exc:
+            self.error = exc
+            print(f"[CAMERA] 相机线程异常退出: {type(exc).__name__}: {exc}")
+        finally:
+            self.done_event.set()
+
+    def _maybe_save_frame(self, frame: np.ndarray, frame_id: int) -> None:
+        if self.args.save_every <= 0:
+            return
+        if frame_id % self.args.save_every != 0:
+            return
+        try:
+            save_dir = Path(self.args.capture_dir)
+            save_dir.mkdir(parents=True, exist_ok=True)
+            # cv2.imwrite expects BGR; AirSim raw Scene order is kept as-is,
+            # so saved colors may be swapped -- fine for pipeline verification.
+            cv2.imwrite(str(save_dir / f"frame_{frame_id:06d}.png"), frame)
+        except Exception as exc:
+            message = str(exc)
+            if message != self._save_warned:
+                self._save_warned = message
+                print(f"[CAMERA] 保存帧失败: {exc}")
+
+    def close(self) -> None:
+        self.stop_event.set()
+        self.thread.join(timeout=10.0)
+
+
+def put_latest(target: queue.Queue[FramePacket], packet: FramePacket) -> None:
+    try:
+        target.get_nowait()
+    except queue.Empty:
+        pass
+    try:
+        target.put_nowait(packet)
+    except queue.Full:
+        pass

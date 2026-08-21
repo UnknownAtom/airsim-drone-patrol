@@ -1,0 +1,9 @@
+airsim
+ultralytics
+torch
+torchvision
+opencv-python
+numpy
+pillow
+pandas
+openpyxl
