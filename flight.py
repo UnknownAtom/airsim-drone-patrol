@@ -360,7 +360,9 @@ def flight_worker(
     任务循环：首次连接/就绪后自动起飞巡航；巡航可被“停止任务”按钮
     中断（降落并回到待命），再点“多航点巡航”可重新开始；Q 键完全退出。
     """
-    client = airsim.MultirotorClient()
+    client = airsim.MultirotorClient(timeout_value=5.0)
+    # timeout_value=5.0：默认 3600s，未连接时 ping() 会阻塞 1 小时导致
+    # “等待 AirSim 信号”永远等不到；短超时让连接检测快速失败并重试。
     api_control = False
     try:
         if not _wait_for_connection(client, stop_event, ui, state_lock):

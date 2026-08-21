@@ -111,7 +111,9 @@ class CaptureWorker:
         delay = 1.0
         while not self.stop_event.is_set():
             try:
-                camera_client = airsim.MultirotorClient()
+                # timeout_value=5.0：默认 3600s，未连接时 confirmConnection
+                # 会阻塞 1 小时；短超时让重连循环快速失败并重试。
+                camera_client = airsim.MultirotorClient(timeout_value=5.0)
                 camera_client.confirmConnection()
                 print("[CAMERA] 相机线程已连接")
                 return camera_client
