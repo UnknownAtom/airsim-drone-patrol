@@ -1,11 +1,13 @@
-"""PyQt6 套壳前端：左侧 PIL 视频区 + 右侧 Qt Widgets 面板。
+"""PyQt6 前端（自包含）：左侧 PIL 视频区 + 右侧 Qt Widgets 面板。
 
-架构（与 ui.py 的接口保持一致，simu.py 无需修改调用方式）：
+本模块不再依赖独立的 ``ui.py``（原纯 PIL 前端已移除）：PIL 渲染基础设施
+（配色、字体、消息、预览绘制）直接内联在本模块中，仅保留 Qt 版实际用到
+的部分。
 
-- 左侧视频区：复用 ``ui.py`` 的 PIL 渲染逻辑（检测框、HUD、chips），
-  渲染结果转为 ``QPixmap`` 显示在 ``QLabel`` 上；
-- 右侧面板：全部使用 Qt Widgets（状态区、信息卡片、进度条、航点路线、
-  目标区、操作按钮、紧凑状态条）；
+- 左侧视频区：PIL 渲染检测框、HUD、chips，结果转为 ``QPixmap`` 显示在
+  ``QLabel`` 上；
+- 右侧面板：Qt Widgets（状态区、信息卡片、进度条、航点路线、目标区、
+  操作按钮、紧凑状态条）；
 - ``show(packet, snapshot, args, ui) -> bool`` 与 ``process_events()``
   签名/语义不变：返回 True 表示用户请求退出（Q 键或关闭窗口）。
 
@@ -15,11 +17,15 @@
 
 from __future__ import annotations
 
+import time
+from collections import deque
+from pathlib import Path
+from threading import Lock
 from typing import Any
 
 import cv2
 import numpy as np
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QFont, QFontDatabase, QImage, QKeySequence, QPainter, QPen, QPixmap, QShortcut
@@ -36,28 +42,418 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from ui import (
-    COLORS,
-    UIMessages,
-    DetectionDisplay as PilDetectionDisplay,
-    _display_name,
-)
-
 WINDOW_TITLE = "AirSim 无人机目标检测系统"
 
 # ---------------------------------------------------------------------------
-# 颜色与字体辅助
+# PIL 渲染基础设施（原 ui.py 内联，仅保留 Qt 版使用部分）
+# ---------------------------------------------------------------------------
+
+DISPLAY_NAME_MAP = {
+    "pedestrian": "行人",
+    "people": "人群",
+    "bicycle": "自行车",
+    "car": "汽车",
+    "van": "面包车",
+    "truck": "卡车",
+    "tricycle": "三轮车",
+    "awning-tricycle": "篷车",
+    "bus": "公交车",
+    "motor": "摩托车",
+    "others": "其他",
+}
+
+
+def _display_name(name: str) -> str:
+    return DISPLAY_NAME_MAP.get(str(name).strip().lower(), str(name))
+
+
+# 调色板：浅蓝预览面 + 深蓝主操作色的视觉锚点
+COLORS: dict[str, tuple[int, int, int]] = {
+    "bg": (242, 242, 247),
+    "surface": (255, 255, 255),
+    "preview": (206, 229, 237),
+    "primary": (50, 76, 180),
+    "primary_soft": (238, 241, 251),
+    "text": (26, 26, 46),
+    "muted": (92, 96, 112),
+    "muted_light": (118, 121, 136),
+    "border": (225, 226, 235),
+    "soft_gray": (242, 242, 247),
+    "soft_blue": (238, 241, 251),
+    "success": (56, 142, 60),
+    "warning": (211, 47, 47),
+    "warning_soft": (252, 235, 235),
+    "white": (255, 255, 255),
+    "image_border": (255, 255, 255),
+}
+
+SCHEMES = {"light": COLORS, "dark": COLORS}
+
+TYPE = {
+    "title": (20, 700),
+    "section": (20, 700),
+    "status": (32, 700),
+    "value": (16, 500),
+    "card": (16, 500),
+    "body": (14, 400),
+    "label": (12, 500),
+    "small": (12, 400),
+    "button": (16, 700),
+}
+
+
+def _is_cjk(char: str) -> bool:
+    code = ord(char)
+    return (
+        0x2E80 <= code <= 0x9FFF
+        or 0x3000 <= code <= 0x303F
+        or 0xF900 <= code <= 0xFAFF
+        or 0xFF00 <= code <= 0xFFEF
+    )
+
+
+class UIFonts:
+    """PIL 侧中文字体加载（微软雅黑优先，黑体回退）。"""
+
+    CJK = {
+        400: ("msyh.ttc", "msyh.ttf", "simhei.ttf"),
+        500: ("msyh.ttc", "msyh.ttf", "simhei.ttf"),
+        700: ("msyhbd.ttc", "msyhbd.ttf", "msyh.ttc"),
+    }
+    LATIN = {
+        400: ("bahnschrift.ttf", "segoeui.ttf"),
+        500: ("bahnschrift.ttf", "segoeui.ttf"),
+        700: ("bahnschrift.ttf", "segoeuib.ttf"),
+    }
+
+    def __init__(self) -> None:
+        self.base_dir = Path(__file__).resolve().parent
+        self.cache: dict[tuple[int, int, bool], ImageFont.FreeTypeFont] = {}
+
+    def _load(self, size: int, weight: int, cjk: bool) -> ImageFont.FreeTypeFont:
+        key = (size, weight, cjk)
+        if key in self.cache:
+            return self.cache[key]
+        names = (self.CJK if cjk else self.LATIN).get(weight, self.LATIN[400])
+        font = None
+        for name in names:
+            for directory in (self.base_dir / "fonts", Path("C:/Windows/Fonts")):
+                path = directory / name
+                if not path.exists():
+                    continue
+                try:
+                    font = ImageFont.truetype(str(path), size)
+                    break
+                except OSError:
+                    continue
+            if font is not None:
+                break
+        if font is None:
+            font = ImageFont.load_default(size=size)
+        self.cache[key] = font
+        return font
+
+    def measure(self, text: str, size: int, weight: int = 400) -> float:
+        return self._load(size, weight, True).getlength(str(text))
+
+    def draw(
+        self,
+        draw: ImageDraw.ImageDraw,
+        xy: tuple[float, float],
+        text: str,
+        size: int,
+        weight: int = 400,
+        fill: tuple[int, int, int, int] = (26, 26, 46, 255),
+    ) -> float:
+        font = self._load(size, weight, True)
+        draw.text(xy, str(text), font=font, fill=fill, anchor="la")
+        return font.getlength(str(text))
+
+
+class UIMessages:
+    """线程安全的消息队列（飞行/取图线程写入，GUI 读取）。"""
+
+    def __init__(self, maxlen: int = 40, ttl: float = 8.0) -> None:
+        self._items: deque[tuple[float, str, str]] = deque(maxlen=maxlen)
+        self._ttl = ttl
+        self._lock = Lock()
+
+    def push(self, kind: str, text: str) -> None:
+        with self._lock:
+            self._items.append((time.monotonic() + self._ttl, kind, text))
+
+    def snapshot(self, now: float | None = None) -> list[tuple[str, str]]:
+        now = time.monotonic() if now is None else now
+        with self._lock:
+            return [(kind, text) for expires, kind, text in self._items if expires > now]
+
+
+def _rgba(color: tuple[int, int, int], alpha: int = 255) -> tuple[int, int, int, int]:
+    return color + (alpha,)
+
+
+def _rounded(
+    draw: ImageDraw.ImageDraw,
+    box: tuple[float, float, float, float],
+    fill: tuple[int, int, int],
+    radius: int = 20,
+    outline: tuple[int, int, int] | None = None,
+    width: int = 1,
+) -> None:
+    draw.rounded_rectangle(
+        tuple(int(value) for value in box),
+        radius=int(radius),
+        fill=_rgba(fill),
+        outline=_rgba(outline) if outline else None,
+        width=width,
+    )
+
+
+def _fit_image(
+    source_w: int,
+    source_h: int,
+    box: tuple[int, int, int, int],
+) -> tuple[float, float, float, float, float]:
+    x1, y1, x2, y2 = box
+    scale = min(
+        (x2 - x1) / max(1, source_w),
+        (y2 - y1) / max(1, source_h),
+    )
+    width = source_w * scale
+    height = source_h * scale
+    return (
+        x1 + (x2 - x1 - width) / 2,
+        y1 + (y2 - y1 - height) / 2,
+        width,
+        height,
+        scale,
+    )
+
+
+def _clip(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+def _paste_rounded(
+    canvas: Image.Image,
+    source: Image.Image,
+    xy: tuple[int, int],
+    size: tuple[int, int],
+    radius: int,
+) -> None:
+    resized = source.resize(size, Image.Resampling.BILINEAR).convert("RGBA")
+    mask = Image.new("L", size, 0)
+    mask_draw = ImageDraw.Draw(mask)
+    mask_draw.rounded_rectangle(
+        (0, 0, size[0] - 1, size[1] - 1), radius=radius, fill=255
+    )
+    canvas.paste(resized, xy, mask)
+
+
+class _PilRenderer:
+    """PIL 预览渲染器：检测框、HUD、chips（原 ui.py DetectionDisplay 精简版）。"""
+
+    def __init__(self) -> None:
+        self.scheme = COLORS
+        self.fonts = UIFonts()
+        self.last_packet: Any = None
+        self.last_snapshot: Any = None
+        self.last_render: np.ndarray | None = None
+
+    def _text(
+        self,
+        draw: ImageDraw.ImageDraw,
+        xy: tuple[float, float],
+        text: str,
+        style: str,
+        color: str = "text",
+    ) -> None:
+        size, weight = TYPE[style]
+        self.fonts.draw(draw, xy, text, size, weight, _rgba(self.scheme[color]))
+
+    def _center_text(
+        self,
+        draw: ImageDraw.ImageDraw,
+        box: tuple[int, int, int, int],
+        text: str,
+        style: str,
+        color: str = "text",
+    ) -> None:
+        size, weight = TYPE[style]
+        text_width = self.fonts.measure(text, size, weight)
+        self.fonts.draw(
+            draw,
+            ((box[0] + box[2] - text_width) / 2, box[1]),
+            text,
+            size,
+            weight,
+            _rgba(self.scheme[color]),
+        )
+
+    def _draw_target_icon(
+        self,
+        draw: ImageDraw.ImageDraw,
+        cx: int,
+        cy: int,
+        color: tuple[int, int, int],
+        scale: float = 1.0,
+    ) -> None:
+        radius = int(13 * scale)
+        draw.ellipse(
+            (cx - radius, cy - radius, cx + radius, cy + radius),
+            outline=_rgba(color),
+            width=2,
+        )
+        core = int(4 * scale)
+        draw.ellipse(
+            (cx - core, cy - core, cx + core, cy + core),
+            fill=_rgba(color),
+        )
+        gap = int(17 * scale)
+        length = int(7 * scale)
+        draw.line((cx - gap, cy, cx - gap + length, cy), fill=_rgba(color), width=2)
+        draw.line((cx + gap - length, cy, cx + gap, cy), fill=_rgba(color), width=2)
+        draw.line((cx, cy - gap, cx, cy - gap + length), fill=_rgba(color), width=2)
+        draw.line((cx, cy + gap - length, cx, cy + gap), fill=_rgba(color), width=2)
+
+    def _chip(
+        self,
+        draw: ImageDraw.ImageDraw,
+        x: int,
+        y: int,
+        text: str,
+        *,
+        fill: str = "primary_soft",
+        color: str = "primary",
+        dot: str | None = None,
+    ) -> tuple[int, int]:
+        size, weight = TYPE["small"]
+        dot_width = 12 if dot else 0
+        width = int(self.fonts.measure(text, size, weight) + 24 + dot_width)
+        height = 30
+        _rounded(draw, (x, y, x + width, y + height), self.scheme[fill], 15)
+        text_x = x + 12
+        if dot:
+            draw.ellipse((x + 10, y + 12, x + 16, y + 18), fill=_rgba(self.scheme[dot]))
+            text_x += dot_width
+        self.fonts.draw(draw, (text_x, y + 7), text, size, weight, _rgba(self.scheme[color]))
+        return width, height
+
+    def _draw_preview(
+        self,
+        canvas: Image.Image,
+        draw: ImageDraw.ImageDraw,
+        box: tuple[int, int, int, int],
+        ui: dict[str, Any],
+    ) -> None:
+        x1, y1, x2, y2 = box
+        _rounded(draw, box, self.scheme["preview"], 20)
+        inner = (x1 + 15, y1 + 15, x2 - 15, y2 - 15)
+        _rounded(draw, inner, self.scheme["preview"], 14)
+        image_box = (inner[0] + 1, inner[1] + 1, inner[2] - 1, inner[3] - 1)
+
+        if self.last_packet is None:
+            self._draw_target_icon(
+                draw,
+                (inner[0] + inner[2]) // 2,
+                (inner[1] + inner[3]) // 2 - 15,
+                self.scheme["primary"],
+                1.2,
+            )
+            self._center_text(
+                draw,
+                (inner[0], inner[1] + (inner[3] - inner[1]) // 2 + 28, inner[2], inner[3]),
+                "系统准备就绪，等待相机画面…",
+                "body",
+                "muted",
+            )
+            return
+
+        frame = self.last_packet.frame
+        source_h, source_w = frame.shape[:2]
+        px, py, pw, ph, scale = _fit_image(source_w, source_h, image_box)
+        image = Image.fromarray(frame).convert("RGB")
+        _paste_rounded(
+            canvas,
+            image,
+            (int(px), int(py)),
+            (max(1, int(pw)), max(1, int(ph))),
+            12,
+        )
+
+        hud_text = f"实时画面  ·  前视相机  ·  {source_w}×{source_h}"
+        hud_w = int(self.fonts.measure(hud_text, *TYPE["small"]) + 32)
+        _rounded(
+            draw,
+            (inner[0] + 12, inner[1] + 12, inner[0] + 12 + hud_w, inner[1] + 42),
+            self.scheme["preview"],
+            15,
+        )
+        draw.ellipse(
+            (inner[0] + 22, inner[1] + 24, inner[0] + 28, inner[1] + 30),
+            fill=_rgba(self.scheme["primary"]),
+        )
+        self._text(draw, (inner[0] + 37, inner[1] + 19), hud_text, "small", "primary")
+
+        if self.last_snapshot is not None:
+            for xmin, ymin, xmax, ymax, _class_id, confidence, name in self.last_snapshot.boxes:
+                accent = "primary" if confidence >= 0.45 else "warning"
+                left = _clip(px + xmin * scale, image_box[0], image_box[2])
+                top = _clip(py + ymin * scale, image_box[1], image_box[3])
+                right = _clip(px + xmax * scale, image_box[0], image_box[2])
+                bottom = _clip(py + ymax * scale, image_box[1], image_box[3])
+                if right <= left or bottom <= top:
+                    continue
+                draw.rounded_rectangle(
+                    (left, top, right, bottom),
+                    radius=4,
+                    outline=_rgba(self.scheme[accent]),
+                    width=3,
+                )
+                label = f"{_display_name(name)}  {confidence:.0%}"
+                label_w = int(self.fonts.measure(label, *TYPE["small"]) + 18)
+                label_h = 25
+                label_y = top - label_h - 4 if top - label_h - 4 >= image_box[1] else bottom + 4
+                label_y = _clip(label_y, image_box[1], image_box[3] - label_h)
+                _rounded(
+                    draw,
+                    (left, label_y, min(image_box[2], left + label_w), label_y + label_h),
+                    self.scheme["surface"],
+                    8,
+                )
+                self._text(draw, (left + 9, label_y + 6), label, "small", accent)
+
+        frame_id = self.last_packet.frame_id
+        detection_count = len(self.last_snapshot.boxes) if self.last_snapshot is not None else 0
+        self._chip(draw, inner[0] + 12, inner[3] - 42, f"帧 {frame_id:06d}", fill="preview", color="primary")
+        self._chip(draw, inner[0] + 128, inner[3] - 42, f"目标 {detection_count}", fill="preview", color="primary")
+
+    def _status_values(self, ui: dict[str, Any]) -> tuple[str, str, str]:
+        camera_ok = bool(ui.get("camera_ok"))
+        detections = int(ui.get("detections", 0))
+        waypoint = int(ui.get("waypoint_index", 0))
+        if not ui.get("airsim_connected", False):
+            return "等待 AirSim 信号", "muted", "未检测到 AirSim 模拟器，请先启动场景"
+        if not camera_ok:
+            return "待命", "muted", "等待相机连接"
+        if detections > 0:
+            return "● 发现目标", "warning", "正在进行目标检测"
+        if waypoint > 0:
+            return "● 自动巡航", "primary", "实时视觉检测中"
+        return "● 监测中", "success", "相机已连接"
+
+
+# ---------------------------------------------------------------------------
+# 颜色与字体辅助（Qt 侧）
 # ---------------------------------------------------------------------------
 
 
 def _hex(name: str) -> str:
-    """COLORS 中的 RGB 三元组 -> '#RRGGBB'（QSS 用）。"""
     r, g, b = COLORS[name]
     return f"#{r:02X}{g:02X}{b:02X}"
 
 
 def _hover_hex(name: str, factor: float = 1.1) -> str:
-    """按比例提亮后的颜色（按钮 hover 用）。"""
     r, g, b = COLORS[name]
     r, g, b = (min(255, int(v * factor)) for v in (r, g, b))
     return f"#{r:02X}{g:02X}{b:02X}"
@@ -75,8 +471,7 @@ _font_names_cache: tuple[str, str] | None = None
 
 
 def _font_names() -> tuple[str, str]:
-    """懒加载字体名：QFontDatabase 需要 QApplication 已存在，
-    因此不能在模块导入时调用。"""
+    """懒加载字体名：QFontDatabase 需要 QApplication 已存在。"""
     global _font_names_cache
     if _font_names_cache is None:
         _font_names_cache = (
@@ -95,12 +490,12 @@ def _make_font(size: int, weight: int = 400, latin: bool = False) -> QFont:
 
 
 # ---------------------------------------------------------------------------
-# 自定义控件
+# Qt 自定义控件
 # ---------------------------------------------------------------------------
 
 
 class RouteWidget(QWidget):
-    """航点路线图：水平线 + 圆点标记，当前航点高亮（与原 PIL 版本一致）。"""
+    """航点路线图：水平线 + 圆点标记，当前航点高亮。"""
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -123,7 +518,6 @@ class RouteWidget(QWidget):
         line_y = height // 2
         left, right = 14, width - 14
 
-        # 基线
         painter.setPen(QPen(QColor(_hex("border")), 3))
         painter.drawLine(left, line_y, right, line_y)
 
@@ -201,20 +595,14 @@ class _MainWindow(QMainWindow):
 # ---------------------------------------------------------------------------
 
 
-class DetectionDisplay(PilDetectionDisplay):
-    """SCD 风格 Qt 控制台：左侧 PIL 视频区 + 右侧 Qt Widgets 面板。
+class DetectionDisplay(_PilRenderer):
+    """SCD 风格 Qt 控制台：左侧 PIL 视频区 + 右侧 Qt Widgets 面板。"""
 
-    复用 ``ui.py`` 的 PIL 渲染（``_draw_preview``：检测框、HUD、chips）、
-    状态计算（``_status_values``）与字体/配色体系；右侧信息面板全部由
-    Qt Widgets 实现。
-    """
-
-    # 布局阈值：低于该尺寸时切换为底部紧凑状态条
     COMPACT_MIN_WIDTH = 1120
     COMPACT_MIN_HEIGHT = 720
 
     def __init__(self, theme: str = "light") -> None:
-        super().__init__(theme)  # 复用配色/字体/状态
+        super().__init__()
         self._app = QApplication.instance() or QApplication([])
         self._quit_requested = False
         self._window_shown = False
@@ -303,7 +691,7 @@ class DetectionDisplay(PilDetectionDisplay):
         self.route_widget = RouteWidget()
         panel.addWidget(self.route_widget)
 
-        # 当前目标
+        # 当前目标（显示全部检测目标）
         self.target_label = QLabel("当前画面没有检测目标")
         self.target_label.setFont(_make_font(15))
         self.target_label.setStyleSheet(
@@ -344,20 +732,15 @@ class DetectionDisplay(PilDetectionDisplay):
         button.setCursor(Qt.CursorShape.PointingHandCursor)
         button.setFixedHeight(46)
         if danger:
-            style = (
-                f"QPushButton {{ background: {_hex('warning')}; color: white;"
-                f" border: none; border-radius: 8px; font-size: 15px; font-weight: 700; }}"
-                f"QPushButton:hover {{ background: {_hover_hex('warning')}; }}"
-                f"QPushButton:pressed {{ background: {_hex('warning')}; }}"
-            )
+            base, hover = _hex("warning"), _hover_hex("warning")
         else:
-            style = (
-                f"QPushButton {{ background: {_hex('primary')}; color: white;"
-                f" border: none; border-radius: 8px; font-size: 15px; font-weight: 700; }}"
-                f"QPushButton:hover {{ background: {_hover_hex('primary')}; }}"
-                f"QPushButton:pressed {{ background: {_hex('primary')}; }}"
-            )
-        button.setStyleSheet(style)
+            base, hover = _hex("primary"), _hover_hex("primary")
+        button.setStyleSheet(
+            f"QPushButton {{ background: {base}; color: white;"
+            f" border: none; border-radius: 8px; font-size: 15px; font-weight: 700; }}"
+            f"QPushButton:hover {{ background: {hover}; }}"
+            f"QPushButton:pressed {{ background: {base}; }}"
+        )
         return button
 
     def _qss(self) -> str:
@@ -377,7 +760,7 @@ class DetectionDisplay(PilDetectionDisplay):
         print(f"[UI] 按钮动作（预留）: {action}")
 
     # ------------------------------------------------------------------
-    # 对外接口（与 ui.py 语义一致）
+    # 对外接口（与旧 ui.py 语义一致）
     # ------------------------------------------------------------------
     def show(self, packet: Any, snapshot: Any, args: Any, ui: dict[str, Any]) -> bool:
         if args.no_display:

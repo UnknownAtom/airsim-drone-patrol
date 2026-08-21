@@ -9,8 +9,7 @@ Module layout (split from a single script; behavior unchanged):
 - ``flight.py``: waypoints, collision monitor and the flight thread;
 - ``capture.py``: camera connection/retry and the capture thread;
 - ``detector.py``: YOLO model loading, inference and the detection thread;
-- ``ui_qt.py``: PyQt6 前端（左侧 PIL 视频区 + 右侧 Qt Widgets 面板）;
-- ``ui.py``: 原纯 PIL 前端（保留，接口兼容）。
+- ``ui_qt.py``: PyQt6 前端（左侧 PIL 视频区 + 右侧 Qt Widgets 面板，自包含）。
 
 Robustness design (differences from earlier versions that "took off then
 landed immediately and showed no camera images"):

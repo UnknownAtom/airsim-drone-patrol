@@ -60,7 +60,7 @@ simu.py              组装入口
 flight.py            航点/碰撞/飞行线程
 capture.py           相机/取图线程
 detector.py          YOLO 加载/推理/检测线程
-ui_qt.py              PyQt6 界面（ui.py 为原纯 PIL 版）
+ui_qt.py              PyQt6 界面
 waypoints.json       巡航航点
 settings_airsimnh_hd.json  1280×720 相机配置示例
 README_AI.md         面向 AI 助手的详细项目说明

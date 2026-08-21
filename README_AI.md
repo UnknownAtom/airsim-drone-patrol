@@ -16,7 +16,7 @@
 
 ## 2. 当前运行状态
 
-当前主程序是 `simu.py`（组装入口）。飞行/取图/检测逻辑分别在 `flight.py`、`capture.py`、`detector.py` 中，界面在 `ui_qt.py`（PyQt6 前端，左侧复用 `ui.py` 的 PIL 渲染）。整体包含：
+当前主程序是 `simu.py`（组装入口）。飞行/取图/检测逻辑分别在 `flight.py`、`capture.py`、`detector.py` 中，界面在 `ui_qt.py`（PyQt6 前端，左侧 PIL 视频区 + 右侧 Qt Widgets 面板，自包含）。整体包含：
 
 - AirSim 多航点巡航；
 - 起飞、爬升、航点移动、悬停和降落；
@@ -44,7 +44,6 @@
 | `capture.py` | 取图模块：相机连接/重连、帧采集线程、最新帧入队 |
 | `detector.py` | 检测模块：YOLO 模型加载/推理、检测线程、检测快照 |
 | `ui_qt.py` | PyQt6 前端：左侧 PIL 视频区（检测框/HUD）+ 右侧 Qt Widgets 面板（信息卡片/进度条/航点路线/按钮） |
-| `ui.py` | 原纯 PIL 前端（保留，接口兼容，供回退/参考） |
 | `waypoints.json` | 当前巡航航点配置 |
 | `visdrone-yolov26l.pt` | 默认主模型（Ultralytics 格式，VisDrone 10 类 + others） |
 | `yolov5s-visdrone.pt` | 旧版 YOLOv5 VisDrone 权重（备用，走 Torch Hub 加载） |
@@ -280,7 +279,7 @@ python simu.py --device 0 --save-every 30
 推荐的最小验证：
 
 ```powershell
-python -m py_compile simu.py flight.py capture.py detector.py ui.py ui_qt.py
+python -m py_compile simu.py flight.py capture.py detector.py ui_qt.py
 ```
 
 如果改动涉及完整依赖，再运行：
