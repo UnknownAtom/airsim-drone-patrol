@@ -25,11 +25,18 @@
 - PyQt6 GUI 主线程显示，视频画面内部使用 PIL 绘制；
 - 只保留最新帧，避免检测队列堆积造成“画面停在第一帧”；
 - AirSim 相机连接失败后的重试和重连；
+- 飞行中 RPC 断线后的重新连接、重新确认场景和按当前位置恢复当前航点；
+- 启动阶段 `reset()` 或 API 控制失败也会进入重连流程；重连后会检查无人机是否已落地，必要时重新起飞；
+- 起飞和降落使用状态轮询，停止/Q 键不再依赖无限等待的异步任务 `join()`；
 - 碰撞状态基线与起飞初期 grace period；
 - 可选保存原始相机帧用于排查取图问题。
 - 检测结果会校验对应帧是否进入显示历史，拒绝未来帧和过期帧的错误叠加；
 - 飞行线程发布 `DISCONNECTED/CONNECTING/READY/TAKING_OFF/CRUISING/STOPPING/LANDING/ERROR/STOPPED` 状态；
 - 界面显示采集 FPS、推理 FPS、推理耗时、检测延迟和丢帧数量；
+- 阶段三增加取图 RPC、图像解析、YOLO、GUI 渲染的滚动平均/最大耗时和最近窗口 FPS；
+- 固定使用原始 Scene 采集模式；压缩 Scene 实测会降低当前本机采集性能，相关分支已移除；
+- CUDA/RTX 自动使用 FP16，模型启动时预热，并记录模型加载、预热和真实首帧推理耗时；
+- GUI 默认限制为 18 FPS，采集线程仍可独立按 25 FPS 调度；无新画面时跳过 PIL 重绘；
 - 启动时校验 AirSim 端口、超时、模型阈值、图像尺寸、巡航速度等参数。
 
 当前不应默认恢复：
@@ -46,6 +53,9 @@
 | `simu.py` | 组装入口：参数解析、线程协调、GUI 主循环（原单文件拆分后的主程序） |
 | `flight.py` | 飞行模块：航点加载/钳制、碰撞监控、飞行线程 |
 | `capture.py` | 取图模块：相机连接/重连、帧采集线程、最新帧入队 |
+| `airsim_connection.py` | AirSim 客户端创建、独立会话关闭和连接生命周期辅助 |
+| `performance.py` | 线程安全滚动耗时统计和最近窗口 FPS 统计 |
+| `benchmark_capture.py` | 独立相机基准工具，不加载 YOLO、不起飞，测试原始 Scene |
 | `detector.py` | 检测模块：YOLO 模型加载/推理、检测线程、检测快照 |
 | `ui_qt.py` | PyQt6 前端：左侧 PIL 视频区（检测框/HUD）+ 右侧 Qt Widgets 面板（信息卡片/进度条/航点路线/按钮/运行指标） |
 | `settings.json` | AirSim 用户配置，建议明确设置 `SimMode: Multirotor` 和相机分辨率 |
@@ -138,6 +148,8 @@ python simu.py --model yolov5s-visdrone.pt --device 0
 
 `--imgsz` 是 YOLO 推理尺寸，不是 AirSim 相机采集尺寸。默认推理尺寸为 640；不要为了提高速度而把 AirSim 原始帧改成 256×144 后再推理。
 
+CUDA 设备会自动使用 FP16；`--half` 可显式表达这一意图，CPU 会自动回退 FP32。模型加载后会用代表性的 1280×720 空帧预热一次，预热不计入实时检测 FPS；结束摘要会同时打印模型加载时间、预热时间和真实首帧推理时间。可用 `--imgsz 416` 降低延迟，`--imgsz 640` 保持默认检测效果，`--imgsz 768` 适合更重视小目标的测试。
+
 VisDrone 权重常见类别为：
 
 ```text
@@ -158,9 +170,10 @@ truck, tricycle, awning-tricycle, bus, motor
 图像处理的关键约束：
 
 1. `simGetImages()` 获取 Scene 图像；
-2. 原始数组直接送入 YOLO，保持当前已验证的通路；
-3. 仅在 GUI 显示阶段 resize 到窗口大小；
-4. 检测框按照源图像到显示窗口的比例映射。
+2. 默认原始数组直接送入 YOLO，保持当前已验证的通路；
+3. 原始数组直接送入 YOLO，GUI resize 只发生在显示阶段；
+4. AirSim 源图像保持至少 1280×720；
+5. 检测框按照源图像到显示窗口的比例映射。
 
 如果源分辨率仍是 256×144，优先检查 AirSim 的 `settings.json`、相机名称和场景是否重启，不要只放大 GUI 窗口。
 
@@ -168,7 +181,7 @@ truck, tricycle, awning-tricycle, bus, motor
 
 程序默认连接 `127.0.0.1:41451`。`--airsim-ip`、`--airsim-port` 和 `--airsim-timeout` 会同时作用于飞行客户端和相机客户端。
 
-不要同时启动 AirSimNH 和 CityEnviron 并让它们都使用默认的 `41451` 端口。端口处于 LISTEN 状态不代表 AirSim RPC 已经可用；如果 `ping()` 超时，先关闭另一个仿真器并重启目标场景，再检查端口。
+不要同时启动 AirSimNH 和 CityEnviron 并让它们都使用默认的 `41451` 端口。端口处于 LISTEN 状态不代表 AirSim RPC 已经可用；如果 `ping()` 超时，先关闭另一个仿真器并重启目标场景，再检查端口。飞行和相机线程各自创建客户端，但统一使用 `airsim_connection.py` 的端点配置和释放逻辑。
 
 建议在 `%USERPROFILE%\Documents\AirSim\settings.json` 中明确指定多旋翼模式，避免启动时弹出车辆选择对话框：
 
@@ -207,12 +220,32 @@ YOLO 检测线程
     └─ 取最新帧 → 推理 → 最新检测结果
 
 PyQt6 GUI 主线程
-    └─ 取最新显示帧 → PIL 绘制 → QLabel / QApplication.processEvents
+    └─ 取最新显示帧 → 限频 PIL 绘制 → QLabel / 限频 QApplication.processEvents
 ```
 
 队列大小刻意设为 1，并且新帧会覆盖旧帧。这是为了降低延迟：实时画面宁可丢弃旧帧，也不能让检测线程处理几秒前的画面。
 
-禁止把 `simGetImages()`、YOLO 推理或 AirSim RPC 长调用重新放进 GUI 主线程，否则窗口可能再次卡死。也不要在到达航点后直接对一个尚未结束的移动任务调用阻塞式 `hoverAsync().join()`；当前实现会先 `cancelLastTask()`。
+阶段三的性能口径：
+
+- `simGetImages` 平均/最大耗时：只统计 AirSim RPC 阶段；
+- 图像解析平均/最大耗时：统计原始字节流到 NumPy 数组的解析；
+- 取图 FPS：最近约 3 秒的成功采集帧率，同时保留总平均 FPS；
+- YOLO 平均耗时：最近 120 次真实推理样本；最大耗时：本次运行累计最大值；
+- 检测结果延迟：从帧提交检测队列到推理完成；
+- GUI 渲染平均/最大耗时：PIL 画布、检测框、HUD 和 QPixmap 更新；
+- 相机/检测丢帧：最新帧覆盖队列的累计丢弃数量。
+
+默认 GUI `--display-fps 18`，不会降低相机采集或 YOLO 队列提交频率；如果只做采集基准，可使用 `--no-display`，并对比结束摘要中的分项统计。
+
+若只测试 AirSim 原始取图链路，使用独立基准工具，避免模型加载和飞行路径影响结果：
+
+```powershell
+python benchmark_capture.py --frames 120
+```
+
+禁止把 `simGetImages()`、YOLO 推理或 AirSim RPC 长调用重新放进 GUI 主线程，否则窗口可能再次卡死。飞行线程中的起飞、爬升和降落使用状态轮询与超时，不依赖阻塞式 `join()`；到达航点后会先 `cancelLastTask()` 再发送悬停。
+
+飞行中的连续 RPC 失败会触发安全恢复：关闭失效会话、重新 `ping()`、确认场景状态、重新取得 API 控制和解锁状态，然后按当前无人机位置重新计算当前航点。恢复流程不会调用 `reset()`，也不会把无人机传送回起点。若重连失败，任务进入 `ERROR` 并执行有界的降落/释放流程。
 
 ## 9. 航点和坐标规则
 
@@ -315,7 +348,7 @@ python simu.py --device 0 --save-every 30
 推荐的最小验证：
 
 ```powershell
-python -m py_compile simu.py flight.py capture.py detector.py ui_qt.py
+python -m py_compile simu.py flight.py capture.py detector.py ui_qt.py performance.py benchmark_capture.py
 ```
 
 如果改动涉及完整依赖，再运行：

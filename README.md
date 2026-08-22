@@ -7,7 +7,9 @@
 - **多航点巡航**：JSON 配置航点，支持多圈巡航、X/Y 分轴移动、速度与高度钳制
 - **目标检测**：默认 VisDrone 预训练权重（行人/车辆等 11 类），兼容 YOLOv5 与 Ultralytics 两种模型格式
 - **稳定性保护**：飞行状态机、RPC 连续失败计数、停止/降落状态显示和启动参数校验
-- **实时诊断**：显示采集 FPS、推理 FPS、推理耗时、检测延迟和丢帧数量
+- **断线恢复**：飞行中 AirSim RPC 断开后按当前位置重连并恢复当前航点；若仿真器重启导致无人机落地，会先重新起飞，不执行中途自动 reset
+- **实时诊断**：显示采集/检测/GUI FPS、取图/图像解析/推理平均与最大耗时、检测延迟和丢帧数量
+- **性能模式**：固定使用原始 Scene 取图；GUI 默认限频，CUDA 自动使用 FP16 并进行模型预热
 - **调试参数支持**：`--save-every` / `--save-ui-every` 保存原始帧与界面帧，`--debug` 输出帧率诊断等等
 
 ## 架构
@@ -15,8 +17,11 @@
 ```
 simu.py
  ├── flight.py   飞行模块：航点/碰撞监控/飞行线程
+ ├── airsim_connection.py  AirSim 客户端创建与释放辅助
  ├── capture.py  取图模块：相机连接重连/帧采集线程
  ├── detector.py 检测模块：模型加载/推理/检测线程
+ ├── performance.py  性能滚动统计与 FPS 窗口
+ ├── benchmark_capture.py  不启动飞行的原始 Scene 取图基准工具
  └── ui_qt.py   界面模块：PyQt6 前端（左视频 PIL + 右面板 Widgets）
 ```
 
@@ -50,7 +55,9 @@ python simu.py --device 0
 | `--model` | `visdrone-yolov26l.pt` | 模型路径（Ultralytics 或 其他格式） |
 | `--conf` / `--iou` | `0.35` / `0.45` | 置信度 / NMS IoU 阈值 |
 | `--imgsz` | `640` | YOLO 推理尺寸 |
+| `--half` | 自动 | CUDA/RTX 默认 FP16；CPU 自动回退 FP32 |
 | `--capture-fps` | `25` | 相机目标采集帧率，实际值受 AirSim RPC 延迟限制 |
+| `--display-fps` | `18` | GUI 最大渲染帧率，不限制相机采集 |
 | `--waypoints-file` | `waypoints.json` | 航点配置文件 |
 | `--loops` | `1` | 巡航圈数，`0` 表示持续巡航 |
 | `--cruise-z` | `-15` | 巡航高度（NED 坐标，负值向上） |
@@ -59,6 +66,15 @@ python simu.py --device 0
 | `--debug` | 关闭 | 输出帧号与航点诊断信息 |
 | `--airsim-ip` / `--airsim-port` | `127.0.0.1` / `41451` | AirSim RPC 地址与端口 |
 | `--airsim-timeout` | `5` | 单次 AirSim RPC 超时时间（秒） |
+
+原始 Scene 取图基准可使用以下命令，观察 `simGetImages`、图像解析和实际采集 FPS：
+
+```powershell
+python simu.py --device 0 --capture-fps 25
+python benchmark_capture.py --frames 120
+```
+
+项目固定使用原始 Scene。实测压缩模式在当前本机 AirSim 环境中将采集速度从约 13.7 FPS 降至 6.84 FPS，因此已移除压缩取图分支。
 
 ## 项目结构
 
