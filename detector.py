@@ -14,6 +14,7 @@ import argparse
 import queue
 import threading
 import time
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -21,6 +22,8 @@ from typing import Any
 import numpy as np
 import torch
 from ultralytics import YOLO
+
+from performance import RateWindow, RollingStats, StatsSnapshot
 
 
 def class_name(names: Any, class_id: int) -> str:
@@ -61,9 +64,16 @@ class DetectorBackend:
         self.model_path = Path(model_path).expanduser().resolve()
         self.args = args
         self.is_yolov5 = "yolov5" in self.model_path.name.lower()
+        self.device = normalize_torch_device(args.device)
+        self.use_half = self._resolve_half()
+        self.model_load_ms = 0.0
+        self.warmup_ms = 0.0
+        load_started = time.perf_counter()
 
         if self.is_yolov5:
             self.model = self._load_yolov5()
+            if self.use_half:
+                self.model.half()
             self.names = getattr(self.model, "names", {})
             print(f"已加载 YOLOv5 VisDrone 模型：{self.model_path.name}")
             print(f"类别：{self.names}")
@@ -71,6 +81,14 @@ class DetectorBackend:
             self.model = YOLO(str(self.model_path))
             self.names = getattr(self.model, "names", {})
             print(f"已加载 Ultralytics 模型：{self.model_path.name}")
+        self.model_load_ms = (time.perf_counter() - load_started) * 1000.0
+        print(
+            f"推理设备：{self.device}；精度：{'FP16' if self.use_half else 'FP32'}；"
+            f"模型加载：{self.model_load_ms:.1f} ms"
+        )
+        self.warmup_ms = self._warmup()
+        if self.warmup_ms > 0:
+            print(f"模型预热完成：{self.warmup_ms:.1f} ms")
 
     def _load_yolov5(self) -> Any:
         """Load the legacy checkpoint through the official YOLOv5 hub code."""
@@ -90,15 +108,60 @@ class DetectorBackend:
             trust_repo=True,
             verbose=False,
         )
-        device = normalize_torch_device(self.args.device)
-        model.to(device)
+        model.to(self.device)
         model.conf = self.args.conf
         model.iou = self.args.iou
         return model
 
-    def infer(self, frame: np.ndarray) -> list[ModelBox]:
+    def _resolve_half(self) -> bool:
+        requested = bool(getattr(self.args, "half", False))
+        cuda_available = torch.cuda.is_available() and self.device.startswith("cuda")
+        if requested and not cuda_available:
+            print("[DETECTOR] --half 需要 CUDA，当前设备改用 FP32")
+        # RTX/CUDA uses FP16 by default; --half makes the intent explicit.
+        return cuda_available
+
+    def synchronize(self) -> None:
+        if self.device.startswith("cuda") and torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+    def _predict(self, frame: np.ndarray) -> Any:
         if self.is_yolov5:
-            results = self.model(frame, size=self.args.imgsz)
+            return self.model(frame, size=self.args.imgsz)
+        options: dict[str, Any] = {
+            "source": frame,
+            "conf": self.args.conf,
+            "iou": self.args.iou,
+            "imgsz": self.args.imgsz,
+            "device": self.device,
+            "half": self.use_half,
+            "verbose": False,
+        }
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message=r".*'half' is deprecated.*")
+            return self.model.predict(**options)
+
+    def _warmup(self) -> float:
+        """Run one representative inference before the first live frame."""
+        dummy = np.zeros((720, 1280, 3), dtype=np.uint8)
+        try:
+            self.synchronize()
+            started = time.perf_counter()
+            with torch.inference_mode():
+                self._predict(dummy)
+            self.synchronize()
+            return (time.perf_counter() - started) * 1000.0
+        except Exception as exc:
+            print(f"[DETECTOR] 模型预热失败，将继续使用实时首帧初始化：{type(exc).__name__}: {exc}")
+            return 0.0
+
+    def infer(self, frame: np.ndarray) -> list[ModelBox]:
+        with torch.inference_mode():
+            return self._infer(frame)
+
+    def _infer(self, frame: np.ndarray) -> list[ModelBox]:
+        if self.is_yolov5:
+            results = self._predict(frame)
             predictions = results.xyxy[0].detach().cpu().numpy()
             names = getattr(results, "names", self.names)
             return [
@@ -114,16 +177,7 @@ class DetectorBackend:
                 for row in predictions
             ]
 
-        options: dict[str, Any] = {
-            "source": frame,
-            "conf": self.args.conf,
-            "iou": self.args.iou,
-            "imgsz": self.args.imgsz,
-            "verbose": False,
-        }
-        if self.args.device:
-            options["device"] = self.args.device
-        result = self.model.predict(**options)[0]
+        result = self._predict(frame)[0]
         boxes: list[ModelBox] = []
         for box in result.boxes:
             class_id = int(box.cls[0].item())
@@ -155,6 +209,9 @@ class DetectionSnapshot:
     frame_id: int
     boxes: tuple[tuple[float, float, float, float, int, float, str], ...]
     submitted_monotonic: float = 0.0
+    completed_monotonic: float = 0.0
+    inference_ms: float = 0.0
+    latency_ms: float = 0.0
 
 
 class DetectionWorker:
@@ -175,10 +232,14 @@ class DetectionWorker:
         self.disabled = False
         self._last_error_message: str | None = None
         self.jobs_dropped = 0
+        self.outputs_dropped = 0
         self.inferences_completed = 0
         self.last_inference_ms = 0.0
-        self._inference_window_started = time.monotonic()
-        self._inference_window_completed = 0
+        self.first_inference_ms = 0.0
+        self.last_latency_ms = 0.0
+        self.inference_stats = RollingStats()
+        self.latency_stats = RollingStats()
+        self._inference_rate = RateWindow(seconds=3.0)
         self.thread = threading.Thread(target=self._run, name="yolo-detection", daemon=True)
         self.thread.start()
 
@@ -214,9 +275,14 @@ class DetectionWorker:
             except queue.Empty:
                 continue
             try:
+                self.backend.synchronize()
                 started = time.perf_counter()
-                model_boxes = self.backend.infer(job.frame)
+                with torch.inference_mode():
+                    model_boxes = self.backend.infer(job.frame)
+                self.backend.synchronize()
                 inference_ms = (time.perf_counter() - started) * 1000.0
+                completed_monotonic = time.monotonic()
+                latency_ms = max(0.0, (completed_monotonic - job.submitted_monotonic) * 1000.0)
                 snapshot_boxes: list[tuple[float, float, float, float, int, float, str]] = []
                 for box in model_boxes:
                     snapshot_boxes.append(
@@ -240,13 +306,21 @@ class DetectionWorker:
                             job.frame_id,
                             tuple(snapshot_boxes),
                             job.submitted_monotonic,
+                            completed_monotonic,
+                            inference_ms,
+                            latency_ms,
                         )
                     )
                 except queue.Full:
-                    pass
+                    self.outputs_dropped += 1
                 self.inferences_completed += 1
-                self._inference_window_completed += 1
                 self.last_inference_ms = inference_ms
+                self.last_latency_ms = latency_ms
+                if self.inferences_completed == 1:
+                    self.first_inference_ms = inference_ms
+                self.inference_stats.add(inference_ms)
+                self.latency_stats.add(latency_ms)
+                self._inference_rate.mark(completed_monotonic)
                 consecutive_errors = 0
             except Exception as exc:
                 consecutive_errors += 1
@@ -275,7 +349,17 @@ class DetectionWorker:
 
     @property
     def inference_fps(self) -> float:
-        elapsed = time.monotonic() - self._inference_window_started
-        if elapsed < 0.1:
-            return 0.0
-        return self._inference_window_completed / elapsed
+        return self._inference_rate.rate()
+
+    @property
+    def performance_snapshot(self) -> dict[str, StatsSnapshot | float]:
+        return {
+            "inference": self.inference_stats.snapshot(),
+            "latency": self.latency_stats.snapshot(),
+            "fps": self.inference_fps,
+            "first_inference_ms": self.first_inference_ms,
+            "model_load_ms": self.backend.model_load_ms,
+            "warmup_ms": self.backend.warmup_ms,
+            "half": self.backend.use_half,
+            "device": self.backend.device,
+        }

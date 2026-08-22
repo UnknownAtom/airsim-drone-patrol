@@ -1,6 +1,7 @@
 """取图模块：AirSim 相机连接、帧采集与相机线程。
 
 - ``get_scene_frame``：读取 Scene 相机原始帧，失败时返回错误描述；
+- ``read_scene_frame``：读取原始 Scene 帧，并返回分项耗时；
 - ``CaptureWorker``：独立相机线程，连接失败无限重试，连续取图失败自动重连；
 - ``put_latest``：只保留最新帧的覆盖式入队。
 
@@ -21,47 +22,92 @@ import airsim
 import cv2
 import numpy as np
 
+from airsim_connection import close_client, new_client
 from detector import DetectionWorker
+from performance import RateWindow, RollingStats, StatsSnapshot
 
 
 _last_image_warning_at = 0.0
 
 
-def get_scene_frame(client: airsim.MultirotorClient, camera_name: str) -> tuple[np.ndarray | None, str | None]:
-    """Return (frame, None) on success or (None, error_description) on failure.
+@dataclass(frozen=True)
+class SceneFrameRead:
+    frame: np.ndarray | None
+    error: str | None
+    rpc_ms: float = 0.0
+    parse_ms: float = 0.0
+
+
+def read_scene_frame(
+    client: airsim.MultirotorClient,
+    camera_name: str,
+) -> SceneFrameRead:
+    """Read one raw Scene frame and measure RPC and array parsing separately.
 
     Failures are reported to the caller instead of being silently swallowed,
     so the capture worker can keep a useful error for the final summary.
     """
     global _last_image_warning_at
+    rpc_started = time.perf_counter()
     try:
         responses = client.simGetImages(
             [airsim.ImageRequest(camera_name, airsim.ImageType.Scene, False, False)]
         )
+        rpc_ms = (time.perf_counter() - rpc_started) * 1000.0
         if not responses:
-            return None, "simGetImages 返回空列表"
+            return SceneFrameRead(None, "simGetImages 返回空列表", rpc_ms)
         response = responses[0]
+        parse_started = time.perf_counter()
         payload = bytes(response.image_data_uint8 or b"")
-        if response.height <= 0 or response.width <= 0 or not payload:
-            return None, f"无效图像: h={response.height}, w={response.width}, len={len(payload)}"
+        if not payload:
+            return SceneFrameRead(
+                None,
+                f"无效图像: h={response.height}, w={response.width}, len=0",
+                rpc_ms,
+                _elapsed_ms(parse_started),
+            )
 
+        if response.height <= 0 or response.width <= 0:
+            return SceneFrameRead(
+                None,
+                f"无效图像: h={response.height}, w={response.width}, len={len(payload)}",
+                rpc_ms,
+                _elapsed_ms(parse_started),
+            )
         expected_size = response.height * response.width * 3
-        image = np.frombuffer(payload, dtype=np.uint8)
-        if image.size < expected_size:
-            return None, f"图像数据过短: {image.size} < {expected_size}"
-        image = image[:expected_size].reshape(response.height, response.width, 3)
+        image_1d = np.frombuffer(payload, dtype=np.uint8)
+        if image_1d.size < expected_size:
+            return SceneFrameRead(
+                None,
+                f"图像数据过短: {image_1d.size} < {expected_size}",
+                rpc_ms,
+                _elapsed_ms(parse_started),
+            )
+        image = image_1d[:expected_size].reshape(response.height, response.width, 3)
 
-        # Keep the raw AirSim pixel order here. This matches the user's known-
-        # working loop, which sends the reshaped Scene buffer directly to YOLO.
         # Display resizing is handled later and does not alter the inference input.
-        return image, None
+        return SceneFrameRead(image, None, rpc_ms, _elapsed_ms(parse_started))
     except Exception as exc:
+        rpc_ms = _elapsed_ms(rpc_started)
         message = f"simGetImages 异常: {type(exc).__name__}: {exc}"
         now = time.monotonic()
         if now - _last_image_warning_at >= 2.0:
             _last_image_warning_at = now
             print(f"[CAMERA] {message}")
-        return None, message
+        return SceneFrameRead(None, message, rpc_ms)
+
+
+def _elapsed_ms(started: float) -> float:
+    return max(0.0, (time.perf_counter() - started) * 1000.0)
+
+
+def get_scene_frame(
+    client: airsim.MultirotorClient,
+    camera_name: str,
+) -> tuple[np.ndarray | None, str | None]:
+    """Backward-compatible two-value wrapper around :func:`read_scene_frame`."""
+    result = read_scene_frame(client, camera_name)
+    return result.frame, result.error
 
 
 @dataclass(frozen=True)
@@ -100,6 +146,10 @@ class CaptureWorker:
         self.frames_dropped = 0
         self.connect_attempts = 0
         self._fps_started = 0.0
+        self._capture_rate = RateWindow(seconds=3.0)
+        self.rpc_stats = RollingStats()
+        self.parse_stats = RollingStats()
+        self.capture_stats = RollingStats()
         self._save_warned: str | None = None
         self.thread = threading.Thread(target=self._run, name="airsim-camera", daemon=True)
 
@@ -112,11 +162,7 @@ class CaptureWorker:
             self.connect_attempts += 1
             camera_client = None
             try:
-                camera_client = airsim.MultirotorClient(
-                    ip=self.args.airsim_ip,
-                    port=self.args.airsim_port,
-                    timeout_value=self.args.airsim_timeout,
-                )
+                camera_client = new_client(self.args)
                 camera_client.confirmConnection()
                 with self.state_lock:
                     self.ui["camera_error"] = ""
@@ -127,10 +173,7 @@ class CaptureWorker:
                 return camera_client
             except Exception as exc:
                 if camera_client is not None:
-                    try:
-                        camera_client.client.close()
-                    except Exception:
-                        pass
+                    close_client(camera_client)
                 self.error = exc
                 error_text = f"{type(exc).__name__}: {exc}"
                 with self.state_lock:
@@ -158,9 +201,16 @@ class CaptureWorker:
                 wait_seconds = next_capture_at - time.monotonic()
                 if wait_seconds > 0 and self.stop_event.wait(wait_seconds):
                     break
-                rpc_started = time.perf_counter()
-                frame, error = get_scene_frame(camera_client, self.args.camera)
-                self.last_capture_rpc_ms = (time.perf_counter() - rpc_started) * 1000.0
+                read_result = read_scene_frame(
+                    camera_client,
+                    self.args.camera,
+                )
+                frame = read_result.frame
+                error = read_result.error
+                self.last_capture_rpc_ms = read_result.rpc_ms
+                self.rpc_stats.add(read_result.rpc_ms)
+                self.parse_stats.add(read_result.parse_ms)
+                self.capture_stats.add(read_result.rpc_ms + read_result.parse_ms)
                 if frame is None:
                     consecutive_failures += 1
                     with self.state_lock:
@@ -170,7 +220,7 @@ class CaptureWorker:
                     if consecutive_failures >= 50:
                         print("[CAMERA] 连续取图失败，尝试重新连接...")
                         try:
-                            camera_client.close()
+                            close_client(camera_client)
                         except Exception:
                             pass
                         camera_client = self._connect()
@@ -184,6 +234,7 @@ class CaptureWorker:
 
                 consecutive_failures = 0
                 self.frames_captured += 1
+                self._capture_rate.mark()
                 with self.state_lock:
                     self.ui["frames_captured"] = self.frames_captured
                     self.ui["camera_ok"] = True
@@ -208,10 +259,7 @@ class CaptureWorker:
         finally:
             # 统一释放客户端（正常退出/异常退出/重连失败退出均覆盖）
             if camera_client is not None:
-                try:
-                    camera_client.close()
-                except Exception:
-                    pass
+                close_client(camera_client)
 
     def _maybe_save_frame(self, frame: np.ndarray, frame_id: int) -> None:
         if self.args.save_every <= 0:
@@ -239,10 +287,23 @@ class CaptureWorker:
     def capture_fps(self) -> float:
         if self._fps_started <= 0:
             return 0.0
-        elapsed = time.monotonic() - self._fps_started
-        if elapsed < 0.1:
+        return self._capture_rate.rate()
+
+    @property
+    def capture_fps_total(self) -> float:
+        if self._fps_started <= 0:
             return 0.0
-        return self.frames_captured / elapsed
+        elapsed = time.monotonic() - self._fps_started
+        return self.frames_captured / max(0.1, elapsed)
+
+    def performance_snapshot(self) -> dict[str, StatsSnapshot | float]:
+        return {
+            "rpc": self.rpc_stats.snapshot(),
+            "parse": self.parse_stats.snapshot(),
+            "capture": self.capture_stats.snapshot(),
+            "fps": self.capture_fps,
+            "fps_total": self.capture_fps_total,
+        }
 
 
 def put_latest(target: queue.Queue[FramePacket], packet: FramePacket) -> bool:

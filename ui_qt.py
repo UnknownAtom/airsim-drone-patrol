@@ -43,6 +43,8 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from performance import RateWindow, RollingStats, StatsSnapshot
+
 WINDOW_TITLE = "AirSim 无人机目标检测系统"
 
 # ---------------------------------------------------------------------------
@@ -250,6 +252,11 @@ class _PilRenderer:
         self.last_packet: Any = None
         self.last_snapshot: Any = None
         self.last_render: np.ndarray | None = None
+        self.render_stats = RollingStats()
+        self._render_rate = RateWindow(seconds=3.0)
+        self.render_count = 0
+        self._next_render_at = 0.0
+        self._last_event_pump = 0.0
         self._detection_fresh = False
         # Keep a short history so a DetectionSnapshot can be verified against
         # a frame that was actually displayed. The live queue intentionally
@@ -843,6 +850,7 @@ class DetectionDisplay(_PilRenderer):
             self._push_message(ui, "正在等待 AirSim 信号，请启动模拟器")
             return
         ui["start_cruise"].set()
+        ui["stop_cruise"].clear()
         if ui.get("airsim_ready", False):
             self._push_message(ui, "已发送开始指令，即将起飞")
         else:
@@ -880,6 +888,7 @@ class DetectionDisplay(_PilRenderer):
         if args.no_display:
             return False
         self._cruise_ui = ui
+        has_update = packet is not None or snapshot is not None or not self._window_shown
         if packet is not None:
             self.last_packet = packet
             self._frame_history.append(packet)
@@ -905,25 +914,40 @@ class DetectionDisplay(_PilRenderer):
                 self._detection_packet is not None
                 and 0 <= current_id - detection_id <= 2
             )
+        now = time.monotonic()
+        if not has_update or (self._window_shown and now < self._next_render_at):
+            return self.process_events()
         if not self._window_shown:
             self._window.resize(max(960, int(args.display_width)), max(600, int(args.display_height)))
             self._window.show()
             self._window_shown = True
 
-        self._render_video(ui)
+        render_started = time.perf_counter()
+        self._render_video(ui, save_render=int(getattr(args, "save_ui_every", 0)) > 0)
         self._update_panel(ui)
         self._update_compact()
-        QApplication.processEvents()
+        render_ms = (time.perf_counter() - render_started) * 1000.0
+        self.render_stats.add(render_ms)
+        self._render_rate.mark()
+        self.render_count += 1
+        display_fps = max(1.0, float(getattr(args, "display_fps", 18.0)))
+        self._next_render_at = time.monotonic() + 1.0 / display_fps
+        self.process_events(force=True)
         return self._quit_requested
 
-    def process_events(self) -> bool:
-        QApplication.processEvents()
+    def process_events(self, force: bool = False) -> bool:
+        now = time.monotonic()
+        # Qt event pumping is useful at about 30 Hz; calling it every 5–10 ms
+        # only adds main-thread work when no new frame is available.
+        if force or now - self._last_event_pump >= 1.0 / 30.0:
+            QApplication.processEvents()
+            self._last_event_pump = now
         return self._quit_requested
 
     # ------------------------------------------------------------------
     # 渲染
     # ------------------------------------------------------------------
-    def _render_video(self, ui: dict[str, Any]) -> None:
+    def _render_video(self, ui: dict[str, Any], *, save_render: bool = False) -> None:
         """左侧：PIL 渲染（检测框/HUD）到内存图像 -> QPixmap -> QLabel。"""
         size = self.video_label.size()
         width = max(320, size.width())
@@ -936,8 +960,16 @@ class DetectionDisplay(_PilRenderer):
         qimage = QImage(rgb.data, rgb.shape[1], rgb.shape[0], rgb.shape[1] * 3, QImage.Format.Format_RGB888)
         self.video_label.setPixmap(QPixmap.fromImage(qimage.copy()))
 
-        # 供 --save-ui-every 保存界面帧
-        self.last_render = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        # Only create the extra BGR copy when UI frame saving is enabled.
+        self.last_render = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR) if save_render else None
+
+    @property
+    def render_fps(self) -> float:
+        return self._render_rate.rate()
+
+    @property
+    def render_performance(self) -> StatsSnapshot:
+        return self.render_stats.snapshot()
 
     def _update_panel(self, ui: dict[str, Any]) -> None:
         status, color_key, subtitle = self._status_values(ui)
@@ -955,9 +987,17 @@ class DetectionDisplay(_PilRenderer):
         detection_fps = float(ui.get("detection_fps", 0.0))
         inference_ms = float(ui.get("inference_ms", 0.0))
         detection_latency_ms = float(ui.get("detection_latency_ms", 0.0))
-        capture_rpc_ms = float(ui.get("capture_rpc_ms", 0.0))
+        capture_rpc_avg_ms = float(ui.get("capture_rpc_avg_ms", ui.get("capture_rpc_ms", 0.0)))
+        capture_rpc_max_ms = float(ui.get("capture_rpc_max_ms", 0.0))
+        image_parse_avg_ms = float(ui.get("image_parse_avg_ms", 0.0))
+        image_parse_max_ms = float(ui.get("image_parse_max_ms", 0.0))
+        detection_avg_ms = float(ui.get("detection_avg_ms", inference_ms))
+        detection_max_ms = float(ui.get("detection_max_ms", 0.0))
+        render_fps = float(ui.get("render_fps", 0.0))
         camera_drops = int(ui.get("camera_drops", 0))
         detection_drops = int(ui.get("detection_drops", 0))
+        detection_latency_avg_ms = float(ui.get("detection_latency_avg_ms", detection_latency_ms))
+        detection_latency_max_ms = float(ui.get("detection_latency_max_ms", 0.0))
         boxes = (
             self.last_snapshot.boxes
             if self.last_snapshot is not None and self._detection_fresh
@@ -972,12 +1012,14 @@ class DetectionDisplay(_PilRenderer):
         self.card_waypoint.setText(f"航点进度：{min(index, total):02d} / {total:02d}    第 {round_no} 圈")
         self.card_flight.setText(f"飞行高度：{altitude:.1f} 米    速度：{speed:.2f} 米/秒")
         self.card_performance.setText(
-            f"采集：{capture_fps:.1f} 帧/秒    取图：{capture_rpc_ms:.0f} 毫秒    "
-            f"推理：{detection_fps:.1f} 帧/秒    耗时：{inference_ms:.0f} 毫秒"
+            f"采集：{capture_fps:.1f} 帧/秒    取图：{capture_rpc_avg_ms:.0f}/{capture_rpc_max_ms:.0f} 毫秒    "
+            f"解析：{image_parse_avg_ms:.1f}/{image_parse_max_ms:.1f} 毫秒\n"
+            f"推理：{detection_fps:.1f} 帧/秒    YOLO：{detection_avg_ms:.0f}/{detection_max_ms:.0f} 毫秒    "
+            f"GUI：{render_fps:.1f} 帧/秒"
         )
         self.card_drops.setText(
             f"累计丢帧：相机 {camera_drops}    检测 {detection_drops}    "
-            f"延迟：{detection_latency_ms:.0f} 毫秒"
+            f"延迟：{detection_latency_avg_ms:.0f}/{detection_latency_max_ms:.0f} 毫秒"
         )
 
         self.progress.setRange(0, total)

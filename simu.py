@@ -87,6 +87,8 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
         errors.append("--collision-grace 不能为负数")
     if args.display_width <= 0 or args.display_height <= 0:
         errors.append("--display-width 和 --display-height 必须大于 0")
+    if args.display_fps <= 0 or args.display_fps > 60:
+        errors.append("--display-fps 必须大于 0 且不超过 60")
     if args.save_every < 0 or args.save_ui_every < 0:
         errors.append("--save-every 和 --save-ui-every 不能为负数")
     if errors:
@@ -100,6 +102,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--iou", type=float, default=0.45, help="NMS IoU threshold")
     parser.add_argument("--device", default=None, help="Ultralytics device, e.g. 0 or cpu")
     parser.add_argument("--imgsz", type=int, default=640, help="YOLO inference size; camera can remain HD")
+    parser.add_argument(
+        "--half",
+        action="store_true",
+        help="启用 FP16；CUDA/RTX 设备默认自动启用，CPU 会回退到 FP32",
+    )
     parser.add_argument("--camera", default="0", help="AirSim camera name")
     parser.add_argument(
         "--airsim-ip",
@@ -185,6 +192,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--display-width", type=int, default=1600)
     parser.add_argument("--display-height", type=int, default=900)
     parser.add_argument(
+        "--display-fps",
+        type=float,
+        default=18.0,
+        help="GUI 最大渲染帧率；采集线程仍可按 --capture-fps 独立运行",
+    )
+    parser.add_argument(
         "--theme",
         choices=("dark", "light"),
         default="light",
@@ -222,16 +235,45 @@ def print_summary(
     worker: threading.Thread,
     worker_result: dict[str, Any],
     ui: dict[str, Any],
+    display: DetectionDisplay | None = None,
 ) -> None:
+    capture_perf = capture_worker.performance_snapshot()
+    detector_perf = detector.performance_snapshot
     print("=" * 60)
     print("运行结束汇总：")
     print(f"  采集帧数        : {capture_worker.frames_captured}")
-    print(f"  采集帧率        : {capture_worker.capture_fps:.2f} FPS")
+    print(
+        f"  采集帧率        : {capture_worker.capture_fps:.2f} FPS "
+        f"（总平均 {capture_worker.capture_fps_total:.2f} FPS）"
+    )
+    rpc = capture_perf["rpc"]
+    parse = capture_perf["parse"]
+    capture_time = capture_perf["capture"]
+    print(f"  simGetImages     : 平均 {rpc.average_ms:.2f} / 最大 {rpc.maximum_ms:.2f} ms")
+    print(f"  图像解析         : 平均 {parse.average_ms:.2f} / 最大 {parse.maximum_ms:.2f} ms")
+    print(f"  取图总耗时       : 平均 {capture_time.average_ms:.2f} / 最大 {capture_time.maximum_ms:.2f} ms")
     print(f"  最近取图 RPC     : {capture_worker.last_capture_rpc_ms:.2f} ms")
     print(f"  相机丢帧数      : {capture_worker.frames_dropped}")
     print(f"  提交检测帧数    : {detector.frame_count}")
     print(f"  检测完成帧数    : {detector.inferences_completed}")
+    inference = detector_perf["inference"]
+    latency = detector_perf["latency"]
+    print(
+        f"  YOLO 推理       : 平均 {inference.average_ms:.2f} / 最大 {inference.maximum_ms:.2f} ms "
+        f"（首帧 {detector.first_inference_ms:.2f} ms）"
+    )
+    print(f"  检测帧率        : {detector.inference_fps:.2f} FPS")
+    print(f"  检测结果延迟     : 平均 {latency.average_ms:.2f} / 最大 {latency.maximum_ms:.2f} ms")
     print(f"  检测队列丢帧    : {detector.jobs_dropped}")
+    print(f"  检测输出丢帧    : {detector.outputs_dropped}")
+    print(f"  模型加载/预热   : {detector.backend.model_load_ms:.2f} / {detector.backend.warmup_ms:.2f} ms")
+    print(f"  推理设备/精度   : {detector.backend.device} / {'FP16' if detector.backend.use_half else 'FP32'}")
+    if display is not None:
+        render = display.render_performance
+        print(
+            f"  GUI 渲染        : {display.render_fps:.2f} FPS；"
+            f"平均 {render.average_ms:.2f} / 最大 {render.maximum_ms:.2f} ms"
+        )
     print(f"  最近推理耗时    : {detector.last_inference_ms:.2f} ms")
     print(f"  飞行 RPC 失败   : {ui.get('rpc_failures', 0)}")
     print(f"  相机连接尝试    : {capture_worker.connect_attempts}")
@@ -290,6 +332,19 @@ def main() -> None:
         "camera_drops": 0,
         "detection_drops": 0,
         "capture_rpc_ms": 0.0,
+        "capture_rpc_avg_ms": 0.0,
+        "capture_rpc_max_ms": 0.0,
+        "image_parse_avg_ms": 0.0,
+        "image_parse_max_ms": 0.0,
+        "capture_total_avg_ms": 0.0,
+        "capture_total_max_ms": 0.0,
+        "detection_avg_ms": 0.0,
+        "detection_max_ms": 0.0,
+        "detection_latency_avg_ms": 0.0,
+        "detection_latency_max_ms": 0.0,
+        "render_fps": 0.0,
+        "render_avg_ms": 0.0,
+        "render_max_ms": 0.0,
         "rpc_failures": 0,
         "rpc_consecutive_failures": 0,
         "messages": UIMessages(),
@@ -329,7 +384,7 @@ def main() -> None:
     capture_worker.start()
 
     notified: set[str] = set()
-    ui_saved_frames = 0
+    last_saved_render_count = 0
     try:
         while not done_event.is_set():
             raw_frame = None
@@ -350,12 +405,31 @@ def main() -> None:
             ui["camera_drops"] = capture_worker.frames_dropped
             ui["detection_drops"] = detector.jobs_dropped
             ui["capture_rpc_ms"] = capture_worker.last_capture_rpc_ms
+            capture_perf = capture_worker.performance_snapshot()
+            rpc = capture_perf["rpc"]
+            parse = capture_perf["parse"]
+            capture_time = capture_perf["capture"]
+            ui["capture_rpc_avg_ms"] = rpc.average_ms
+            ui["capture_rpc_max_ms"] = rpc.maximum_ms
+            ui["image_parse_avg_ms"] = parse.average_ms
+            ui["image_parse_max_ms"] = parse.maximum_ms
+            ui["capture_total_avg_ms"] = capture_time.average_ms
+            ui["capture_total_max_ms"] = capture_time.maximum_ms
+            detector_perf = detector.performance_snapshot
+            inference = detector_perf["inference"]
+            latency = detector_perf["latency"]
+            ui["detection_avg_ms"] = inference.average_ms
+            ui["detection_max_ms"] = inference.maximum_ms
+            ui["detection_latency_avg_ms"] = latency.average_ms
+            ui["detection_latency_max_ms"] = latency.maximum_ms
+            ui["detection_latency_ms"] = detector.last_latency_ms
+            if not args.no_display:
+                render = display.render_performance
+                ui["render_fps"] = display.render_fps
+                ui["render_avg_ms"] = render.average_ms
+                ui["render_max_ms"] = render.maximum_ms
             if snapshot is not None:
-                if snapshot.submitted_monotonic > 0:
-                    ui["detection_latency_ms"] = max(
-                        0.0,
-                        (time.monotonic() - snapshot.submitted_monotonic) * 1000.0,
-                    )
+                ui["detection_latency_ms"] = snapshot.latency_ms or detector.last_latency_ms
 
             # Surface worker errors in the UI once
             if capture_worker.error is not None and "camera" not in notified:
@@ -373,12 +447,19 @@ def main() -> None:
             else:
                 should_quit = False if args.no_display else display.process_events()
 
-            if args.save_ui_every > 0 and display.last_render is not None:
-                ui_saved_frames += 1
-                if ui_saved_frames % args.save_ui_every == 0:
+            if (
+                args.save_ui_every > 0
+                and display.last_render is not None
+                and display.render_count != last_saved_render_count
+            ):
+                last_saved_render_count = display.render_count
+                if display.render_count % args.save_ui_every == 0:
                     save_dir = Path(args.capture_dir)
                     save_dir.mkdir(parents=True, exist_ok=True)
-                    cv2.imwrite(str(save_dir / f"ui_{ui_saved_frames:05d}.png"), display.last_render)
+                    cv2.imwrite(
+                        str(save_dir / f"ui_{display.render_count:05d}.png"),
+                        display.last_render,
+                    )
 
             if should_quit:
                 print("收到 Q 键，正在停止飞行线程...")
@@ -407,6 +488,7 @@ def main() -> None:
             worker=worker,
             worker_result=worker_result,
             ui=ui,
+            display=display,
         )
 
 
