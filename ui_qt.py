@@ -37,6 +37,7 @@ from PyQt6.QtWidgets import (
     QMainWindow,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QVBoxLayout,
     QWidget,
@@ -702,14 +703,27 @@ class DetectionDisplay(_PilRenderer):
         self.route_widget = RouteWidget()
         panel.addWidget(self.route_widget)
 
-        # 当前目标（显示全部检测目标）
+        # 当前目标（显示全部检测目标；固定高度 + 滚动，避免目标过多拉长面板）
+        self.target_scroll = QScrollArea()
+        self.target_scroll.setWidgetResizable(True)
+        self.target_scroll.setFixedHeight(150)
+        self.target_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.target_scroll.setStyleSheet(
+            "QScrollArea { background: transparent; border: none; }"
+            "QScrollBar:vertical { background: transparent; width: 8px; margin: 0; }"
+            "QScrollBar::handle:vertical { background: #C9CBD6; border-radius: 4px;"
+            " min-height: 20px; }"
+            "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }"
+        )
         self.target_label = QLabel("当前画面没有检测目标")
         self.target_label.setFont(_make_font(15))
+        self.target_label.setWordWrap(True)
         self.target_label.setStyleSheet(
             f"background: {_hex('soft_gray')}; border-radius: 10px; padding: 12px;"
             f" color: {_hex('muted_light')};"
         )
-        panel.addWidget(self.target_label)
+        self.target_scroll.setWidget(self.target_label)
+        panel.addWidget(self.target_scroll)
 
         panel.addStretch(1)
 
@@ -895,7 +909,7 @@ class DetectionDisplay(_PilRenderer):
         else:
             self.target_label.setText("当前画面没有检测目标")
             self.target_label.setTextFormat(Qt.TextFormat.PlainText)
-            self.target_label.setWordWrap(False)
+            self.target_label.setWordWrap(True)
             self.target_label.setStyleSheet(
                 f"background: {_hex('soft_gray')}; border-radius: 10px; padding: 12px;"
                 f" color: {_hex('muted_light')};"
