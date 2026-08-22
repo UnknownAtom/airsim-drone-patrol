@@ -252,7 +252,6 @@ def print_summary(
     print(f"  simGetImages     : 平均 {rpc.average_ms:.2f} / 最大 {rpc.maximum_ms:.2f} ms")
     print(f"  图像解析         : 平均 {parse.average_ms:.2f} / 最大 {parse.maximum_ms:.2f} ms")
     print(f"  取图总耗时       : 平均 {capture_time.average_ms:.2f} / 最大 {capture_time.maximum_ms:.2f} ms")
-    print(f"  最近取图 RPC     : {capture_worker.last_capture_rpc_ms:.2f} ms")
     print(f"  相机丢帧数      : {capture_worker.frames_dropped}")
     print(f"  提交检测帧数    : {detector.frame_count}")
     print(f"  检测完成帧数    : {detector.inferences_completed}")

@@ -16,7 +16,7 @@
 
 ```
 simu.py
- ├── flight.py   飞行模块：航点/碰撞监控/飞行线程
+ ├── flight.py   飞行模块：航点/碰撞监控/飞行线程（含断线重连）
  ├── airsim_connection.py  AirSim 客户端创建与释放辅助
  ├── capture.py  取图模块：相机连接重连/帧采集线程
  ├── detector.py 检测模块：模型加载/推理/检测线程
@@ -24,6 +24,8 @@ simu.py
  ├── benchmark_capture.py  不启动飞行的原始 Scene 取图基准工具
  └── ui_qt.py   界面模块：PyQt6 前端（左视频 PIL + 右面板 Widgets）
 ```
+
+配置文件：`waypoints.json`（巡航航点）、`settings_airsimnh_hd.json`（1280×720 相机配置示例）；详细说明见 `README_AI.md`。
 
 ## 环境
 

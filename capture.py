@@ -1,7 +1,6 @@
 """取图模块：AirSim 相机连接、帧采集与相机线程。
 
-- ``get_scene_frame``：读取 Scene 相机原始帧，失败时返回错误描述；
-- ``read_scene_frame``：读取原始 Scene 帧，并返回分项耗时；
+- ``read_scene_frame``：读取原始 Scene 帧，并返回分项耗时（RPC/解析）；
 - ``CaptureWorker``：独立相机线程，连接失败无限重试，连续取图失败自动重连；
 - ``put_latest``：只保留最新帧的覆盖式入队。
 
@@ -99,15 +98,6 @@ def read_scene_frame(
 
 def _elapsed_ms(started: float) -> float:
     return max(0.0, (time.perf_counter() - started) * 1000.0)
-
-
-def get_scene_frame(
-    client: airsim.MultirotorClient,
-    camera_name: str,
-) -> tuple[np.ndarray | None, str | None]:
-    """Backward-compatible two-value wrapper around :func:`read_scene_frame`."""
-    result = read_scene_frame(client, camera_name)
-    return result.frame, result.error
 
 
 @dataclass(frozen=True)
