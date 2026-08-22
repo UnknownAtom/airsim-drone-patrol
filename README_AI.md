@@ -51,18 +51,12 @@
 | `settings.json` | AirSim 用户配置，建议明确设置 `SimMode: Multirotor` 和相机分辨率 |
 | `waypoints.json` | 当前巡航航点配置 |
 | `visdrone-yolov26l.pt` | 默认主模型（Ultralytics 格式，VisDrone 10 类 + others） |
-| `yolov5s-visdrone.pt` | 旧版 YOLOv5 VisDrone 权重（备用，走 Torch Hub 加载） |
+| `yolov5s-visdrone.pt` | 旧版 YOLOv5 VisDrone 权重（备用，Torch Hub 加载） |
 | `settings_airsimnh_hd.json` | 1280×720 相机配置示例 |
 | `requirements.txt` | Python 依赖列表 |
-| `captures/` | 使用 `--save-every` 时保存的帧目录 |
-| `AirSimNH.lnk` | AirSimNH 场景快捷方式 |
-| `CityEnviron.lnk` | CityEnviron 场景快捷方式 |
+
 
 > 界面字体使用系统字体（微软雅黑/Bahnschrift），不依赖项目内字体文件。
-
-> 2026-08 拆分记录：`simu.py` 原为单文件（约 1060 行），已按职责拆出 `flight.py`、`capture.py`、`detector.py` 三个平级模块，`simu.py` 保留参数解析、组装与 GUI 主循环。本次为纯移动、无行为改动；依赖方向为 `simu → flight/capture/detector/ui`，`capture → detector`。
-
-当前目录没有 `simple_capture_test.py` 或 `detection_exporter.py`。如果以后新增这些文件，必须先确认用户明确需要，不能仅凭历史描述自动恢复。
 
 前端窗口以某个本地 SCD 风格界面为视觉参考（路径从略），但不修改该参考目录。实际修改目标始终是当前 AirSim 项目目录。界面采用浅灰工作区、左侧大面积浅蓝相机区域、右侧白色实时分析卡片、深蓝任务按钮，以及红绿状态色。
 
