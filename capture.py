@@ -100,6 +100,7 @@ class CaptureWorker:
         self.error: Exception | None = None
         self.last_image_error: str | None = None
         self.frames_captured = 0
+        self.connect_attempts = 0
         self.done_event = threading.Event()
         self._save_warned: str | None = None
         self.thread = threading.Thread(target=self._run, name="airsim-camera", daemon=True)
@@ -110,6 +111,7 @@ class CaptureWorker:
     def _connect(self) -> airsim.MultirotorClient | None:
         delay = 1.0
         while not self.stop_event.is_set():
+            self.connect_attempts += 1
             camera_client = None
             try:
                 camera_client = airsim.MultirotorClient(
@@ -156,6 +158,8 @@ class CaptureWorker:
                 frame, error = get_scene_frame(camera_client, self.args.camera)
                 if frame is None:
                     consecutive_failures += 1
+                    with self.state_lock:
+                        self.ui["camera_ok"] = False
                     if error:
                         self.last_image_error = error
                     if consecutive_failures >= 50:
@@ -196,6 +200,12 @@ class CaptureWorker:
             self.error = exc
             print(f"[CAMERA] 相机线程异常退出: {type(exc).__name__}: {exc}")
         finally:
+            # 统一释放客户端（正常退出/异常退出/重连失败退出均覆盖）
+            if camera_client is not None:
+                try:
+                    camera_client.close()
+                except Exception:
+                    pass
             self.done_event.set()
 
     def _maybe_save_frame(self, frame: np.ndarray, frame_id: int) -> None:

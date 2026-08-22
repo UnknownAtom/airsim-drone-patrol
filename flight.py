@@ -182,18 +182,24 @@ def fly_to_leg(
     monitor: CollisionMonitor | None,
     ui: dict[str, Any],
     state_lock: threading.Lock,
-) -> None:
+) -> bool:
+    """飞向一个航段。正常到达返回 True；被停止（Q/停止按钮）返回 False。
+
+    遥测读取（``getMultirotorState``）允许瞬态失败并重试
+    （``--rpc-retry-limit`` 次），避免单次超时终止整个任务。
+    """
     client.moveToPositionAsync(target.x, target.y, target.z, target.speed)
     deadline = time.monotonic() + args.waypoint_timeout
+    consecutive_rpc_errors = 0
 
     while True:
         if stop_event.is_set():
             client.cancelLastTask()
-            return
+            return False
         if ui["stop_cruise"].is_set():
             # “停止任务”按钮：提前结束当前航段
             client.cancelLastTask()
-            return
+            return False
         if monitor is not None:
             message = monitor.check()
             if message:
@@ -204,7 +210,21 @@ def fly_to_leg(
                     client.cancelLastTask()
                     raise RuntimeError(message)
 
-        if poll_flight(client, target, ui, state_lock) <= target.tolerance:
+        try:
+            distance = poll_flight(client, target, ui, state_lock)
+        except Exception as exc:
+            consecutive_rpc_errors += 1
+            if consecutive_rpc_errors >= args.rpc_retry_limit:
+                raise
+            print(
+                f"[FLIGHT] 遥测读取失败 "
+                f"({consecutive_rpc_errors}/{args.rpc_retry_limit})："
+                f"{type(exc).__name__}: {exc}"
+            )
+            time.sleep(max(0.0, args.poll_interval))
+            continue
+        consecutive_rpc_errors = 0
+        if distance <= target.tolerance:
             break
         if time.monotonic() >= deadline:
             raise TimeoutError(f"Waypoint {waypoint_index} was not reached within {args.waypoint_timeout:.1f}s")
@@ -220,7 +240,17 @@ def fly_to_leg(
     ui["messages"].push("info", f"到达航点 {waypoint_index}")
     client.hoverAsync()
     if args.dwell_seconds > 0:
-        time.sleep(args.dwell_seconds)
+        # dwell 期间持续刷新 UI，并响应停止/退出
+        dwell_deadline = time.monotonic() + args.dwell_seconds
+        while time.monotonic() < dwell_deadline:
+            if stop_event.is_set() or ui["stop_cruise"].is_set():
+                break
+            try:
+                poll_flight(client, target, ui, state_lock)
+            except Exception:
+                pass  # 悬停期间遥测失败不打断 dwell
+            time.sleep(max(0.0, args.poll_interval))
+    return True
 
 
 def fly_to_waypoint(
@@ -240,15 +270,22 @@ def fly_to_waypoint(
     if args.no_axis_split:
         legs = [waypoint]
     else:
-        current_x, current_y, _ = get_position(client)
-        legs = []
-        if abs(current_x - waypoint.x) > waypoint.tolerance:
-            legs.append(Waypoint(waypoint.x, current_y, waypoint.z, waypoint.speed, waypoint.tolerance))
-        if abs(current_y - waypoint.y) > waypoint.tolerance or not legs:
-            legs.append(waypoint)
+        try:
+            current_x, current_y, _ = get_position(client)
+        except Exception as exc:
+            # 定位遥测失败：降级为单腿直飞，不中断任务
+            print(f"[FLIGHT] 分轴定位失败（{type(exc).__name__}），本次航点直飞")
+            ui["messages"].push("warn", "分轴定位失败，本次航点直飞")
+            legs = [waypoint]
+        else:
+            legs = []
+            if abs(current_x - waypoint.x) > waypoint.tolerance:
+                legs.append(Waypoint(waypoint.x, current_y, waypoint.z, waypoint.speed, waypoint.tolerance))
+            if abs(current_y - waypoint.y) > waypoint.tolerance or not legs:
+                legs.append(waypoint)
 
     for leg in legs:
-        fly_to_leg(
+        if not fly_to_leg(
             client=client,
             target=leg,
             stop_event=stop_event,
@@ -259,7 +296,8 @@ def fly_to_waypoint(
             monitor=monitor,
             ui=ui,
             state_lock=state_lock,
-        )
+        ):
+            return  # 被停止：不再执行后续航段
 
 
 def _close_client(client: airsim.MultirotorClient | None) -> None:

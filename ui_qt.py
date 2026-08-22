@@ -262,6 +262,7 @@ class _PilRenderer:
         self.last_packet: Any = None
         self.last_snapshot: Any = None
         self.last_render: np.ndarray | None = None
+        self._detection_fresh = False
 
     def _text(
         self,
@@ -398,7 +399,7 @@ class _PilRenderer:
         )
         self._text(draw, (inner[0] + 37, inner[1] + 19), hud_text, "small", "primary")
 
-        if self.last_snapshot is not None and ui.get("show_detections", True):
+        if self.last_snapshot is not None and self._detection_fresh and ui.get("show_detections", True):
             for xmin, ymin, xmax, ymax, _class_id, confidence, name in self.last_snapshot.boxes:
                 accent = "primary" if confidence >= 0.45 else "warning"
                 left = _clip(px + xmin * scale, image_box[0], image_box[2])
@@ -866,6 +867,13 @@ class DetectionDisplay(_PilRenderer):
             self.last_packet = packet
         if snapshot is not None:
             self.last_snapshot = snapshot
+        # 帧号同步：检测结果比当前画面旧超过 2 帧视为过期，不再绘制/显示
+        if self.last_packet is None or self.last_snapshot is None:
+            self._detection_fresh = False
+        else:
+            self._detection_fresh = (
+                int(self.last_packet.frame_id) - int(self.last_snapshot.frame_id)
+            ) <= 2
         if not self._window_shown:
             self._window.resize(max(960, int(args.display_width)), max(600, int(args.display_height)))
             self._window.show()
@@ -924,7 +932,7 @@ class DetectionDisplay(_PilRenderer):
         self.route_widget.set_progress(total, index)
 
         boxes = self.last_snapshot.boxes if self.last_snapshot is not None else ()
-        if boxes:
+        if boxes and self._detection_fresh:
             # 显示全部检测目标：按置信度降序，逐行着色
             ordered = sorted(boxes, key=lambda box: float(box[5]), reverse=True)
             lines = []
@@ -940,6 +948,12 @@ class DetectionDisplay(_PilRenderer):
             self.target_label.setTextFormat(Qt.TextFormat.RichText)
             self.target_label.setWordWrap(True)
             self.target_label.setStyleSheet("")
+        elif boxes:
+            # 检测结果已过期（帧不同步）：不显示旧目标，避免与画面错位
+            self.target_label.setText("检测更新中…")
+            self.target_label.setTextFormat(Qt.TextFormat.PlainText)
+            self.target_label.setWordWrap(True)
+            self.target_label.setStyleSheet(f"color: {_hex('muted_light')};")
         else:
             self.target_label.setText("当前画面没有检测目标")
             self.target_label.setTextFormat(Qt.TextFormat.PlainText)

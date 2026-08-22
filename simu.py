@@ -82,6 +82,12 @@ def parse_args() -> argparse.Namespace:
         help="AirSim RPC call timeout in seconds",
     )
     parser.add_argument(
+        "--rpc-retry-limit",
+        type=int,
+        default=5,
+        help="Consecutive telemetry RPC failures allowed before aborting",
+    )
+    parser.add_argument(
         "--waypoints-file",
         default=str(DEFAULT_WAYPOINT_FILE),
         help="JSON file containing waypoint objects",
@@ -171,6 +177,7 @@ def print_summary(
     print("运行结束汇总：")
     print(f"  采集帧数        : {capture_worker.frames_captured}")
     print(f"  提交检测帧数    : {detector.frame_count}")
+    print(f"  相机连接尝试    : {capture_worker.connect_attempts}")
     if detector.disabled:
         print("  [DETECTOR] 检测因连续失败已禁用（画面显示不受影响）")
     if detector.error is not None:
