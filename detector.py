@@ -15,7 +15,6 @@ import queue
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -148,11 +147,7 @@ class DetectorBackend:
 class FrameJob:
     frame: np.ndarray
     frame_id: int
-    timestamp: str
-    elapsed_s: float
     submitted_monotonic: float
-    patrol_round: int
-    waypoint_index: int
 
 
 @dataclass(frozen=True)
@@ -181,22 +176,13 @@ class DetectionWorker:
         self._last_error_message: str | None = None
         self.jobs_dropped = 0
         self.inferences_completed = 0
-        self.inference_failures = 0
         self.last_inference_ms = 0.0
-        self.total_inference_ms = 0.0
         self._inference_window_started = time.monotonic()
         self._inference_window_completed = 0
         self.thread = threading.Thread(target=self._run, name="yolo-detection", daemon=True)
         self.thread.start()
 
-    def submit(
-        self,
-        frame: np.ndarray,
-        *,
-        patrol_round: int,
-        waypoint_index: int,
-        started_monotonic: float,
-    ) -> int:
+    def submit(self, frame: np.ndarray) -> int:
         self.frame_count += 1
         frame_id = self.frame_count
         submitted_monotonic = time.monotonic()
@@ -205,11 +191,7 @@ class DetectionWorker:
         job = FrameJob(
             frame=frame,
             frame_id=frame_id,
-            timestamp=datetime.now().isoformat(timespec="milliseconds"),
-            elapsed_s=submitted_monotonic - started_monotonic,
             submitted_monotonic=submitted_monotonic,
-            patrol_round=patrol_round,
-            waypoint_index=waypoint_index,
         )
         # Keep only the newest frame. A backlog would increase latency and make
         # the display appear frozen even though the program is still running.
@@ -265,11 +247,9 @@ class DetectionWorker:
                 self.inferences_completed += 1
                 self._inference_window_completed += 1
                 self.last_inference_ms = inference_ms
-                self.total_inference_ms += inference_ms
                 consecutive_errors = 0
             except Exception as exc:
                 consecutive_errors += 1
-                self.inference_failures += 1
                 message = f"{type(exc).__name__}: {exc}"
                 if message != self._last_error_message:
                     self._last_error_message = message

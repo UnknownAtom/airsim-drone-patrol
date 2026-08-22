@@ -90,8 +90,6 @@ COLORS: dict[str, tuple[int, int, int]] = {
     "image_border": (255, 255, 255),
 }
 
-SCHEMES = {"light": COLORS, "dark": COLORS}
-
 TYPE = {
     "title": (20, 700),
     "section": (20, 700),
@@ -103,16 +101,6 @@ TYPE = {
     "small": (12, 400),
     "button": (16, 700),
 }
-
-
-def _is_cjk(char: str) -> bool:
-    code = ord(char)
-    return (
-        0x2E80 <= code <= 0x9FFF
-        or 0x3000 <= code <= 0x303F
-        or 0xF900 <= code <= 0xFAFF
-        or 0xFF00 <= code <= 0xFFEF
-    )
 
 
 class UIFonts:
@@ -482,12 +470,6 @@ class _PilRenderer:
 
 def _hex(name: str) -> str:
     r, g, b = COLORS[name]
-    return f"#{r:02X}{g:02X}{b:02X}"
-
-
-def _hover_hex(name: str, factor: float = 1.1) -> str:
-    r, g, b = COLORS[name]
-    r, g, b = (min(255, int(v * factor)) for v in (r, g, b))
     return f"#{r:02X}{g:02X}{b:02X}"
 
 
@@ -981,6 +963,8 @@ class DetectionDisplay(_PilRenderer):
             if self.last_snapshot is not None and self._detection_fresh
             else ()
         )
+        # 同步有效目标数（只统计与当前画面匹配的新鲜结果），紧凑状态条据此显示
+        ui["detections"] = len(boxes)
 
         self.card_camera.setText(
             f"相机状态：{'已连接' if camera_ok else '等待连接'}    目标：{len(boxes)} 个"

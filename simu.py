@@ -257,7 +257,6 @@ def main() -> None:
     backend = DetectorBackend(args.model, args)
     detector = DetectionWorker(backend)
     display = DetectionDisplay(args.theme)
-    started_monotonic = time.monotonic()
     frame_queue: queue.Queue[FramePacket] = queue.Queue(maxsize=1)
     stop_event = threading.Event()
     done_event = threading.Event()
@@ -284,12 +283,10 @@ def main() -> None:
         "start_cruise": threading.Event(),
         "stop_cruise": threading.Event(),
         "source_size": (0, 0),
-        "fps": 0.0,
         "capture_fps": 0.0,
         "detection_fps": 0.0,
         "inference_ms": 0.0,
         "detection_latency_ms": 0.0,
-        "frames_dropped": 0,
         "camera_drops": 0,
         "detection_drops": 0,
         "capture_rpc_ms": 0.0,
@@ -299,7 +296,6 @@ def main() -> None:
     }
     worker_result: dict[str, Any] = {
         "waypoints": waypoints,
-        "started_monotonic": started_monotonic,
         "error": None,
     }
     worker = threading.Thread(
@@ -328,14 +324,11 @@ def main() -> None:
         stop_event=stop_event,
         ui=ui,
         state_lock=state_lock,
-        started_monotonic=started_monotonic,
     )
     worker.start()
     capture_worker.start()
 
     notified: set[str] = set()
-    fps_window_frames = 0
-    fps_window_started = time.monotonic()
     ui_saved_frames = 0
     try:
         while not done_event.is_set():
@@ -350,23 +343,14 @@ def main() -> None:
                 print(f"[DEBUG] detect frame_id={snapshot.frame_id}")
 
             # Refresh UI counters (cheap, once per main-loop tick)
-            if raw_frame is not None:
-                fps_window_frames += 1
-            now = time.monotonic()
-            if now - fps_window_started >= 1.0:
-                ui["fps"] = fps_window_frames / (now - fps_window_started)
-                fps_window_frames = 0
-                fps_window_started = now
             ui["frames_captured"] = capture_worker.frames_captured
             ui["capture_fps"] = capture_worker.capture_fps
             ui["detection_fps"] = detector.inference_fps
             ui["inference_ms"] = detector.last_inference_ms
             ui["camera_drops"] = capture_worker.frames_dropped
             ui["detection_drops"] = detector.jobs_dropped
-            ui["frames_dropped"] = capture_worker.frames_dropped + detector.jobs_dropped
             ui["capture_rpc_ms"] = capture_worker.last_capture_rpc_ms
             if snapshot is not None:
-                ui["detections"] = len(snapshot.boxes)
                 if snapshot.submitted_monotonic > 0:
                     ui["detection_latency_ms"] = max(
                         0.0,

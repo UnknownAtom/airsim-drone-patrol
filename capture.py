@@ -1,7 +1,5 @@
 """取图模块：AirSim 相机连接、帧采集与相机线程。
 
-从 simu.py 拆出的独立模块（逻辑与拆分前完全一致）：
-
 - ``get_scene_frame``：读取 Scene 相机原始帧，失败时返回错误描述；
 - ``CaptureWorker``：独立相机线程，连接失败无限重试，连续取图失败自动重连；
 - ``put_latest``：只保留最新帧的覆盖式入队。
@@ -88,7 +86,6 @@ class CaptureWorker:
         stop_event: threading.Event,
         ui: dict[str, Any],
         state_lock: threading.Lock,
-        started_monotonic: float,
     ) -> None:
         self.detector = detector
         self.frame_queue = frame_queue
@@ -96,7 +93,6 @@ class CaptureWorker:
         self.stop_event = stop_event
         self.ui = ui
         self.state_lock = state_lock
-        self.started_monotonic = started_monotonic
         self.error: Exception | None = None
         self.last_image_error: str | None = None
         self.last_capture_rpc_ms = 0.0
@@ -104,7 +100,6 @@ class CaptureWorker:
         self.frames_dropped = 0
         self.connect_attempts = 0
         self._fps_started = 0.0
-        self.done_event = threading.Event()
         self._save_warned: str | None = None
         self.thread = threading.Thread(target=self._run, name="airsim-camera", daemon=True)
 
@@ -153,7 +148,6 @@ class CaptureWorker:
     def _run(self) -> None:
         camera_client = self._connect()
         if camera_client is None:
-            self.done_event.set()
             return
         self._fps_started = time.monotonic()
         capture_interval = 1.0 / self.args.capture_fps
@@ -191,19 +185,12 @@ class CaptureWorker:
                 consecutive_failures = 0
                 self.frames_captured += 1
                 with self.state_lock:
-                    patrol_round = self.ui["patrol_round"]
-                    waypoint_index = self.ui["waypoint_index"]
                     self.ui["frames_captured"] = self.frames_captured
                     self.ui["camera_ok"] = True
                     self.ui["camera_error"] = ""
                     self.ui["source_size"] = (int(frame.shape[1]), int(frame.shape[0]))
 
-                frame_id = self.detector.submit(
-                    frame,
-                    patrol_round=patrol_round,
-                    waypoint_index=waypoint_index,
-                    started_monotonic=self.started_monotonic,
-                )
+                frame_id = self.detector.submit(frame)
                 if put_latest(self.frame_queue, FramePacket(frame, frame_id)):
                     self.frames_dropped += 1
                 self._maybe_save_frame(frame, frame_id)
@@ -225,7 +212,6 @@ class CaptureWorker:
                     camera_client.close()
                 except Exception:
                     pass
-            self.done_event.set()
 
     def _maybe_save_frame(self, frame: np.ndarray, frame_id: int) -> None:
         if self.args.save_every <= 0:
@@ -235,9 +221,10 @@ class CaptureWorker:
         try:
             save_dir = Path(self.args.capture_dir)
             save_dir.mkdir(parents=True, exist_ok=True)
-            # cv2.imwrite expects BGR; AirSim raw Scene order is kept as-is,
-            # so saved colors may be swapped -- fine for pipeline verification.
-            cv2.imwrite(str(save_dir / f"frame_{frame_id:06d}.png"), frame)
+            # AirSim Scene 是 RGB 顺序，cv2.imwrite 按 BGR 保存：仅落盘时转换，
+            # 内存帧与 YOLO 推理输入保持原始顺序不变。
+            save_frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            cv2.imwrite(str(save_dir / f"frame_{frame_id:06d}.png"), save_frame)
         except Exception as exc:
             message = str(exc)
             if message != self._save_warned:
