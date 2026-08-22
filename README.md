@@ -66,6 +66,7 @@ python simu.py --device 0
 | `--debug` | 关闭 | 输出帧号与航点诊断信息 |
 | `--airsim-ip` / `--airsim-port` | `127.0.0.1` / `41451` | AirSim RPC 地址与端口 |
 | `--airsim-timeout` | `5` | 单次 AirSim RPC 超时时间（秒） |
+| `--rpc-retry-limit` | `5` | 遥测连续失败上限，超过后进入断线重连流程 |
 
 原始 Scene 取图基准可使用以下命令，观察 `simGetImages`、图像解析和实际采集 FPS：
 
@@ -80,10 +81,13 @@ python benchmark_capture.py --frames 120
 
 ```
 simu.py              组装入口
-flight.py            航点/碰撞/飞行线程
+flight.py            航点/碰撞/飞行线程（含断线重连）
+airsim_connection.py AirSim 客户端创建/释放辅助
 capture.py           相机/取图线程
 detector.py          YOLO 加载/推理/检测线程
-ui_qt.py              PyQt6 界面
+performance.py       滚动耗时统计与 FPS 窗口
+benchmark_capture.py 取图基准工具（不加载 YOLO/不起飞）
+ui_qt.py             PyQt6 界面
 waypoints.json       巡航航点
 settings_airsimnh_hd.json  1280×720 相机配置示例
 README_AI.md         面向 AI 助手的详细项目说明
