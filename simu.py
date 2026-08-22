@@ -316,14 +316,12 @@ def main() -> None:
         "camera_error": "",
         "airsim_connected": False,
         "airsim_ready": False,
-        "airsim_endpoint": f"{args.airsim_ip}:{args.airsim_port}",
         "airsim_error": "",
         "flight_state": "DISCONNECTED",
         "cruise_started": False,
         "show_detections": True,
         "start_cruise": threading.Event(),
         "stop_cruise": threading.Event(),
-        "source_size": (0, 0),
         "capture_fps": 0.0,
         "detection_fps": 0.0,
         "inference_ms": 0.0,
@@ -335,17 +333,12 @@ def main() -> None:
         "capture_rpc_max_ms": 0.0,
         "image_parse_avg_ms": 0.0,
         "image_parse_max_ms": 0.0,
-        "capture_total_avg_ms": 0.0,
-        "capture_total_max_ms": 0.0,
         "detection_avg_ms": 0.0,
         "detection_max_ms": 0.0,
         "detection_latency_avg_ms": 0.0,
         "detection_latency_max_ms": 0.0,
         "render_fps": 0.0,
-        "render_avg_ms": 0.0,
-        "render_max_ms": 0.0,
         "rpc_failures": 0,
-        "rpc_consecutive_failures": 0,
         "messages": UIMessages(),
     }
     worker_result: dict[str, Any] = {
@@ -407,13 +400,10 @@ def main() -> None:
             capture_perf = capture_worker.performance_snapshot()
             rpc = capture_perf["rpc"]
             parse = capture_perf["parse"]
-            capture_time = capture_perf["capture"]
             ui["capture_rpc_avg_ms"] = rpc.average_ms
             ui["capture_rpc_max_ms"] = rpc.maximum_ms
             ui["image_parse_avg_ms"] = parse.average_ms
             ui["image_parse_max_ms"] = parse.maximum_ms
-            ui["capture_total_avg_ms"] = capture_time.average_ms
-            ui["capture_total_max_ms"] = capture_time.maximum_ms
             detector_perf = detector.performance_snapshot
             inference = detector_perf["inference"]
             latency = detector_perf["latency"]
@@ -423,10 +413,7 @@ def main() -> None:
             ui["detection_latency_max_ms"] = latency.maximum_ms
             ui["detection_latency_ms"] = detector.last_latency_ms
             if not args.no_display:
-                render = display.render_performance
                 ui["render_fps"] = display.render_fps
-                ui["render_avg_ms"] = render.average_ms
-                ui["render_max_ms"] = render.maximum_ms
             if snapshot is not None:
                 ui["detection_latency_ms"] = snapshot.latency_ms or detector.last_latency_ms
 

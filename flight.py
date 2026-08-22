@@ -323,7 +323,6 @@ def fly_to_leg(
             consecutive_rpc_errors += 1
             with state_lock:
                 ui["rpc_failures"] = int(ui.get("rpc_failures", 0)) + 1
-                ui["rpc_consecutive_failures"] = consecutive_rpc_errors
             if consecutive_rpc_errors >= args.rpc_retry_limit:
                 safe_cancel(client)
                 with state_lock:
@@ -341,8 +340,6 @@ def fly_to_leg(
             time.sleep(max(0.0, args.poll_interval))
             continue
         consecutive_rpc_errors = 0
-        with state_lock:
-            ui["rpc_consecutive_failures"] = 0
         if distance <= target.tolerance:
             break
         if time.monotonic() >= deadline:

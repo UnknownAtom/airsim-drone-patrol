@@ -68,6 +68,9 @@ class DetectorBackend:
         self.use_half = self._resolve_half()
         self.model_load_ms = 0.0
         self.warmup_ms = 0.0
+        # ultralytics 的 half 参数在 8.x 会发 deprecation 警告；只在加载时设置一次，
+        # 避免每次推理都创建 catch_warnings 上下文。
+        warnings.filterwarnings("ignore", message=r".*'half' is deprecated.*")
         load_started = time.perf_counter()
 
         if self.is_yolov5:
@@ -137,9 +140,7 @@ class DetectorBackend:
             "half": self.use_half,
             "verbose": False,
         }
-        with warnings.catch_warnings():
-            warnings.filterwarnings("ignore", message=r".*'half' is deprecated.*")
-            return self.model.predict(**options)
+        return self.model.predict(**options)
 
     def _warmup(self) -> float:
         """Run one representative inference before the first live frame."""
@@ -208,9 +209,6 @@ class FrameJob:
 class DetectionSnapshot:
     frame_id: int
     boxes: tuple[tuple[float, float, float, float, int, float, str], ...]
-    submitted_monotonic: float = 0.0
-    completed_monotonic: float = 0.0
-    inference_ms: float = 0.0
     latency_ms: float = 0.0
 
 
@@ -277,8 +275,7 @@ class DetectionWorker:
             try:
                 self.backend.synchronize()
                 started = time.perf_counter()
-                with torch.inference_mode():
-                    model_boxes = self.backend.infer(job.frame)
+                model_boxes = self.backend.infer(job.frame)
                 self.backend.synchronize()
                 inference_ms = (time.perf_counter() - started) * 1000.0
                 completed_monotonic = time.monotonic()
@@ -305,9 +302,6 @@ class DetectionWorker:
                         DetectionSnapshot(
                             job.frame_id,
                             tuple(snapshot_boxes),
-                            job.submitted_monotonic,
-                            completed_monotonic,
-                            inference_ms,
                             latency_ms,
                         )
                     )
@@ -352,14 +346,8 @@ class DetectionWorker:
         return self._inference_rate.rate()
 
     @property
-    def performance_snapshot(self) -> dict[str, StatsSnapshot | float]:
+    def performance_snapshot(self) -> dict[str, StatsSnapshot]:
         return {
             "inference": self.inference_stats.snapshot(),
             "latency": self.latency_stats.snapshot(),
-            "fps": self.inference_fps,
-            "first_inference_ms": self.first_inference_ms,
-            "model_load_ms": self.backend.model_load_ms,
-            "warmup_ms": self.backend.warmup_ms,
-            "half": self.backend.use_half,
-            "device": self.backend.device,
         }

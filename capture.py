@@ -229,7 +229,6 @@ class CaptureWorker:
                     self.ui["frames_captured"] = self.frames_captured
                     self.ui["camera_ok"] = True
                     self.ui["camera_error"] = ""
-                    self.ui["source_size"] = (int(frame.shape[1]), int(frame.shape[0]))
 
                 frame_id = self.detector.submit(frame)
                 if put_latest(self.frame_queue, FramePacket(frame, frame_id)):
@@ -286,13 +285,11 @@ class CaptureWorker:
         elapsed = time.monotonic() - self._fps_started
         return self.frames_captured / max(0.1, elapsed)
 
-    def performance_snapshot(self) -> dict[str, StatsSnapshot | float]:
+    def performance_snapshot(self) -> dict[str, StatsSnapshot]:
         return {
             "rpc": self.rpc_stats.snapshot(),
             "parse": self.parse_stats.snapshot(),
             "capture": self.capture_stats.snapshot(),
-            "fps": self.capture_fps,
-            "fps_total": self.capture_fps_total,
         }
 
 
