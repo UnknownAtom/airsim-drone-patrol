@@ -26,6 +26,27 @@ import airsim
 BASE_DIR = Path(__file__).resolve().parent
 
 
+FLIGHT_STATES = {
+    "DISCONNECTED",
+    "CONNECTING",
+    "READY",
+    "TAKING_OFF",
+    "CRUISING",
+    "STOPPING",
+    "LANDING",
+    "ERROR",
+    "STOPPED",
+}
+
+
+def set_flight_state(ui: dict[str, Any], state_lock: threading.Lock, state: str) -> None:
+    """Publish one consistent flight state for the GUI and diagnostics."""
+    if state not in FLIGHT_STATES:
+        raise ValueError(f"Unknown flight state: {state}")
+    with state_lock:
+        ui["flight_state"] = state
+
+
 @dataclass(frozen=True)
 class Waypoint:
     x: float
@@ -194,10 +215,12 @@ def fly_to_leg(
 
     while True:
         if stop_event.is_set():
+            set_flight_state(ui, state_lock, "STOPPING")
             client.cancelLastTask()
             return False
         if ui["stop_cruise"].is_set():
             # “停止任务”按钮：提前结束当前航段
+            set_flight_state(ui, state_lock, "STOPPING")
             client.cancelLastTask()
             return False
         if monitor is not None:
@@ -214,7 +237,15 @@ def fly_to_leg(
             distance = poll_flight(client, target, ui, state_lock)
         except Exception as exc:
             consecutive_rpc_errors += 1
+            with state_lock:
+                ui["rpc_failures"] = int(ui.get("rpc_failures", 0)) + 1
+                ui["rpc_consecutive_failures"] = consecutive_rpc_errors
             if consecutive_rpc_errors >= args.rpc_retry_limit:
+                with state_lock:
+                    ui["airsim_connected"] = False
+                    ui["airsim_ready"] = False
+                    ui["airsim_error"] = f"遥测连续失败：{type(exc).__name__}: {exc}"
+                set_flight_state(ui, state_lock, "ERROR")
                 raise
             print(
                 f"[FLIGHT] 遥测读取失败 "
@@ -224,6 +255,8 @@ def fly_to_leg(
             time.sleep(max(0.0, args.poll_interval))
             continue
         consecutive_rpc_errors = 0
+        with state_lock:
+            ui["rpc_consecutive_failures"] = 0
         if distance <= target.tolerance:
             break
         if time.monotonic() >= deadline:
@@ -347,6 +380,7 @@ def _wait_for_connection(
         ui["airsim_connected"] = False
         ui["airsim_ready"] = False
         ui["airsim_error"] = ""
+    set_flight_state(ui, state_lock, "CONNECTING")
     while not stop_event.is_set():
         candidate: airsim.MultirotorClient | None = None
         try:
@@ -358,6 +392,7 @@ def _wait_for_connection(
             with state_lock:
                 ui["airsim_connected"] = True
                 ui["airsim_error"] = ""
+            set_flight_state(ui, state_lock, "CONNECTING")
             print(f"[FLIGHT] AirSim RPC 已连接：{endpoint}")
             return candidate
         except Exception as exc:
@@ -367,6 +402,7 @@ def _wait_for_connection(
                 ui["airsim_connected"] = False
                 ui["airsim_ready"] = False
                 ui["airsim_error"] = error_text
+            set_flight_state(ui, state_lock, "CONNECTING")
             if error_text != last_error:
                 last_error = error_text
                 print(f"[FLIGHT] AirSim RPC 连接失败（{endpoint}）：{error_text}")
@@ -400,6 +436,7 @@ def _wait_for_ready(
                 with state_lock:
                     ui["airsim_ready"] = True
                     ui["airsim_error"] = ""
+                set_flight_state(ui, state_lock, "READY")
                 print(f"[FLIGHT] AirSim 场景已就绪：{endpoint}")
                 return client
         except Exception as exc:
@@ -412,6 +449,7 @@ def _wait_for_ready(
             with state_lock:
                 ui["airsim_ready"] = False
                 ui["airsim_error"] = error_text
+            set_flight_state(ui, state_lock, "CONNECTING")
 
             # Reconnect with a new RPC session instead of polling a client
             # whose request already timed out.
@@ -427,10 +465,14 @@ def _wait_for_ready(
 def _takeoff(
     client: airsim.MultirotorClient,
     args: argparse.Namespace,
+    stop_event: threading.Event,
     ui: dict[str, Any],
     state_lock: threading.Lock,
-) -> None:
+) -> bool:
     """起飞并爬升至巡航高度（首次与“重新开始”复用）。"""
+    if stop_event.is_set() or ui["stop_cruise"].is_set():
+        return False
+    set_flight_state(ui, state_lock, "TAKING_OFF")
     client.armDisarm(True)
     print("正在起飞无人机...")
     ui["messages"].push("info", "正在起飞…")
@@ -438,12 +480,17 @@ def _takeoff(
         client.takeoffAsync(timeout_sec=30).join()
     except Exception as exc:
         raise RuntimeError(f"起飞失败（30 秒超时或 RPC 错误）: {exc}") from exc
+    if stop_event.is_set() or ui["stop_cruise"].is_set():
+        safe_cancel(client)
+        return False
     try:
         client.moveToZAsync(args.takeoff_z, 2.0).join()
     except Exception as exc:
         raise RuntimeError(f"爬升至巡航高度失败: {exc}") from exc
     with state_lock:
         ui["cruise_started"] = True
+    set_flight_state(ui, state_lock, "CRUISING")
+    return True
 
 
 def flight_worker(
@@ -462,6 +509,7 @@ def flight_worker(
     """
     client: airsim.MultirotorClient | None = None
     api_control = False
+    landed = False
     try:
         client = _wait_for_connection(args, stop_event, ui, state_lock)
         if client is None:
@@ -479,6 +527,7 @@ def flight_worker(
         while not stop_event.is_set():
             # 等待开始指令：首次自动开始；停止后等待“多航点巡航”按钮
             if not first_run:
+                set_flight_state(ui, state_lock, "READY")
                 print("[FLIGHT] 任务待命：点击“多航点巡航”开始巡航")
                 ui["messages"].push("info", "任务待命：点击“多航点巡航”开始巡航")
                 while not ui["start_cruise"].wait(0.2) and not stop_event.is_set():
@@ -488,7 +537,9 @@ def flight_worker(
                     break
             first_run = False
 
-            _takeoff(client, args, ui, state_lock)
+            landed = False
+            if not _takeoff(client, args, stop_event, ui, state_lock):
+                break
             print(f"巡航高度：{-args.takeoff_z:g} m；最大速度：{args.max_speed:g} m/s")
             print(f"开始巡航：{len(result['waypoints'])} 个航点（“停止任务”按钮或 Q 可停止）")
             ui["messages"].push("info", f"起飞完成，开始巡航（{len(result['waypoints'])} 个航点）")
@@ -504,6 +555,7 @@ def flight_worker(
                     if ui["stop_cruise"].is_set():
                         ui["stop_cruise"].clear()
                         cruise_aborted = True
+                        set_flight_state(ui, state_lock, "STOPPING")
                         print("[FLIGHT] 收到停止指令，正在降落…")
                         ui["messages"].push("info", "收到停止指令，正在降落…")
                         break
@@ -530,9 +582,12 @@ def flight_worker(
                     break
 
             # 本次巡航结束：降落，回到待命
+            landed = False
+            set_flight_state(ui, state_lock, "LANDING")
             safe_cancel(client)
             try:
                 client.landAsync().join()
+                landed = True
             except Exception as exc:
                 print(f"降落过程中出现问题：{exc}")
             try:
@@ -541,25 +596,38 @@ def flight_worker(
                 pass
             with state_lock:
                 ui["cruise_started"] = False
+            if result["error"] is None and not stop_event.is_set():
+                set_flight_state(ui, state_lock, "READY")
             if not stop_event.is_set():
                 print("[FLIGHT] 巡航结束，已降落；等待“多航点巡航”重新开始")
                 ui["messages"].push("info", "巡航结束，已降落")
     except Exception as exc:
         result["error"] = exc
+        set_flight_state(ui, state_lock, "ERROR")
+        with state_lock:
+            ui["cruise_started"] = False
         print(f"[FLIGHT] 巡航线程出错，准备降落: {type(exc).__name__}: {exc}")
         ui["messages"].push("error", f"巡航线程出错：{type(exc).__name__}")
     finally:
+        if result["error"] is None:
+            set_flight_state(ui, state_lock, "LANDING")
         safe_cancel(client)
         if api_control:
-            try:
-                client.landAsync().join()
-            except Exception as exc:
-                print(f"降落过程中出现问题：{exc}")
+            if not landed:
+                try:
+                    client.landAsync().join()
+                    landed = True
+                except Exception as exc:
+                    print(f"降落过程中出现问题：{exc}")
             try:
                 client.armDisarm(False)
                 client.enableApiControl(False)
             except Exception:
                 pass
+        with state_lock:
+            ui["cruise_started"] = False
+        if result["error"] is None:
+            set_flight_state(ui, state_lock, "STOPPED")
         _close_client(client)
         ui["messages"].push("info", "任务结束，已降落")
         done_event.set()

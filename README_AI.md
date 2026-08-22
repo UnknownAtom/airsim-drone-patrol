@@ -10,7 +10,7 @@
 - 按 JSON 航点执行巡航；
 - 持续读取前视 Scene 相机画面；
 - 使用 YOLO 在线检测行人、车辆等目标；
-- 在 OpenCV 窗口中显示检测框、类别、置信度、帧号和源分辨率。
+- 在 PyQt6 窗口中显示检测框、类别、置信度、帧号和源分辨率。
 
 当前优先级是“稳定取图、实时检测、窗口不卡死、航点飞行安全”。CSV/Excel 自动导出暂时不启用。
 
@@ -27,6 +27,10 @@
 - AirSim 相机连接失败后的重试和重连；
 - 碰撞状态基线与起飞初期 grace period；
 - 可选保存原始相机帧用于排查取图问题。
+- 检测结果会校验对应帧是否进入显示历史，拒绝未来帧和过期帧的错误叠加；
+- 飞行线程发布 `DISCONNECTED/CONNECTING/READY/TAKING_OFF/CRUISING/STOPPING/LANDING/ERROR/STOPPED` 状态；
+- 界面显示采集 FPS、推理 FPS、推理耗时、检测延迟和丢帧数量；
+- 启动时校验 AirSim 端口、超时、模型阈值、图像尺寸、巡航速度等参数。
 
 当前不应默认恢复：
 
@@ -43,7 +47,7 @@
 | `flight.py` | 飞行模块：航点加载/钳制、碰撞监控、飞行线程 |
 | `capture.py` | 取图模块：相机连接/重连、帧采集线程、最新帧入队 |
 | `detector.py` | 检测模块：YOLO 模型加载/推理、检测线程、检测快照 |
-| `ui_qt.py` | PyQt6 前端：左侧 PIL 视频区（检测框/HUD）+ 右侧 Qt Widgets 面板（信息卡片/进度条/航点路线/按钮） |
+| `ui_qt.py` | PyQt6 前端：左侧 PIL 视频区（检测框/HUD）+ 右侧 Qt Widgets 面板（信息卡片/进度条/航点路线/按钮/运行指标） |
 | `settings.json` | AirSim 用户配置，建议明确设置 `SimMode: Multirotor` 和相机分辨率 |
 | `waypoints.json` | 当前巡航航点配置 |
 | `visdrone-yolov26l.pt` | 默认主模型（Ultralytics 格式，VisDrone 10 类 + others） |
@@ -262,7 +266,8 @@ AirSim 使用 NED 坐标系：
 | `--imgsz` | `640` | YOLO 推理尺寸 |
 | `--camera` | `0` | AirSim 相机名称 |
 | `--loops` | `1` | 巡航圈数，`0` 表示持续巡航 |
-| `--poll-interval` | `0.10` | 取图/控制轮询间隔 |
+| `--poll-interval` | `0.10` | 飞行遥测轮询间隔 |
+| `--capture-fps` | `25` | 相机目标采集帧率；实际值受 `simGetImages` RPC 耗时限制 |
 | `--cruise-z` | `-15` | 巡航高度，NED 坐标 |
 | `--max-speed` | `2.0` | 速度上限 |
 | `--no-axis-split` | 关闭 | 关闭 X 后 Y 的分轴移动 |

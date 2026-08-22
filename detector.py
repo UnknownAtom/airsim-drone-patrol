@@ -150,6 +150,7 @@ class FrameJob:
     frame_id: int
     timestamp: str
     elapsed_s: float
+    submitted_monotonic: float
     patrol_round: int
     waypoint_index: int
 
@@ -158,6 +159,7 @@ class FrameJob:
 class DetectionSnapshot:
     frame_id: int
     boxes: tuple[tuple[float, float, float, float, int, float, str], ...]
+    submitted_monotonic: float = 0.0
 
 
 class DetectionWorker:
@@ -177,6 +179,13 @@ class DetectionWorker:
         self.error: Exception | None = None
         self.disabled = False
         self._last_error_message: str | None = None
+        self.jobs_dropped = 0
+        self.inferences_completed = 0
+        self.inference_failures = 0
+        self.last_inference_ms = 0.0
+        self.total_inference_ms = 0.0
+        self._inference_window_started = time.monotonic()
+        self._inference_window_completed = 0
         self.thread = threading.Thread(target=self._run, name="yolo-detection", daemon=True)
         self.thread.start()
 
@@ -190,11 +199,15 @@ class DetectionWorker:
     ) -> int:
         self.frame_count += 1
         frame_id = self.frame_count
+        submitted_monotonic = time.monotonic()
+        if self.disabled:
+            return frame_id
         job = FrameJob(
             frame=frame,
             frame_id=frame_id,
             timestamp=datetime.now().isoformat(timespec="milliseconds"),
-            elapsed_s=time.monotonic() - started_monotonic,
+            elapsed_s=submitted_monotonic - started_monotonic,
+            submitted_monotonic=submitted_monotonic,
             patrol_round=patrol_round,
             waypoint_index=waypoint_index,
         )
@@ -202,12 +215,13 @@ class DetectionWorker:
         # the display appear frozen even though the program is still running.
         try:
             self.jobs.get_nowait()
+            self.jobs_dropped += 1
         except queue.Empty:
             pass
         try:
             self.jobs.put_nowait(job)
         except queue.Full:
-            pass
+            self.jobs_dropped += 1
         return frame_id
 
     def _run(self) -> None:
@@ -218,7 +232,9 @@ class DetectionWorker:
             except queue.Empty:
                 continue
             try:
+                started = time.perf_counter()
                 model_boxes = self.backend.infer(job.frame)
+                inference_ms = (time.perf_counter() - started) * 1000.0
                 snapshot_boxes: list[tuple[float, float, float, float, int, float, str]] = []
                 for box in model_boxes:
                     snapshot_boxes.append(
@@ -237,12 +253,23 @@ class DetectionWorker:
                 except queue.Empty:
                     pass
                 try:
-                    self.outputs.put_nowait(DetectionSnapshot(job.frame_id, tuple(snapshot_boxes)))
+                    self.outputs.put_nowait(
+                        DetectionSnapshot(
+                            job.frame_id,
+                            tuple(snapshot_boxes),
+                            job.submitted_monotonic,
+                        )
+                    )
                 except queue.Full:
                     pass
+                self.inferences_completed += 1
+                self._inference_window_completed += 1
+                self.last_inference_ms = inference_ms
+                self.total_inference_ms += inference_ms
                 consecutive_errors = 0
             except Exception as exc:
                 consecutive_errors += 1
+                self.inference_failures += 1
                 message = f"{type(exc).__name__}: {exc}"
                 if message != self._last_error_message:
                     self._last_error_message = message
@@ -265,3 +292,10 @@ class DetectionWorker:
     def close(self) -> None:
         self.stop_event.set()
         self.thread.join(timeout=15.0)
+
+    @property
+    def inference_fps(self) -> float:
+        elapsed = time.monotonic() - self._inference_window_started
+        if elapsed < 0.1:
+            return 0.0
+        return self._inference_window_completed / elapsed

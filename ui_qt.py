@@ -263,6 +263,12 @@ class _PilRenderer:
         self.last_snapshot: Any = None
         self.last_render: np.ndarray | None = None
         self._detection_fresh = False
+        # Keep a short history so a DetectionSnapshot can be verified against
+        # a frame that was actually displayed. The live queue intentionally
+        # drops old frames, so a future detection result must never be painted
+        # on an unrelated current frame.
+        self._frame_history: deque[Any] = deque(maxlen=8)
+        self._detection_packet: Any = None
 
     def _text(
         self,
@@ -428,14 +434,21 @@ class _PilRenderer:
                 self._text(draw, (left + 9, label_y + 6), label, "small", accent)
 
         frame_id = self.last_packet.frame_id
-        detection_count = len(self.last_snapshot.boxes) if self.last_snapshot is not None else 0
+        detection_count = (
+            len(self.last_snapshot.boxes)
+            if self.last_snapshot is not None and self._detection_fresh
+            else 0
+        )
         self._chip(draw, inner[0] + 12, inner[3] - 42, f"帧 {frame_id:06d}", fill="preview", color="primary")
         self._chip(draw, inner[0] + 128, inner[3] - 42, f"目标 {detection_count}", fill="preview", color="primary")
 
     def _status_values(self, ui: dict[str, Any]) -> tuple[str, str, str]:
         camera_ok = bool(ui.get("camera_ok"))
-        detections = int(ui.get("detections", 0))
         waypoint = int(ui.get("waypoint_index", 0))
+        flight_state = str(ui.get("flight_state", ""))
+        if flight_state == "ERROR":
+            error = str(ui.get("airsim_error", "")).strip()
+            return "● 任务异常", "warning", error or "飞行线程出现异常，请检查终端日志"
         if not ui.get("airsim_connected", False):
             error = str(ui.get("airsim_error", "")).strip()
             subtitle = "未检测到 AirSim 模拟器，请先启动场景"
@@ -444,12 +457,18 @@ class _PilRenderer:
             return "等待 AirSim 信号", "muted", subtitle
         if not ui.get("airsim_ready", False):
             return "等待场景就绪", "muted", "AirSim 已连接，场景加载中…"
+        if flight_state == "TAKING_OFF":
+            return "● 正在起飞", "primary", "正在爬升至巡航高度"
+        if flight_state == "STOPPING":
+            return "● 正在停止", "warning", "正在取消航段并准备降落"
+        if flight_state == "LANDING":
+            return "● 正在降落", "primary", "正在执行安全降落"
         if not ui.get("cruise_started", False):
             return "● 任务待命", "primary", "点击“多航点巡航”开始任务"
         if not camera_ok:
             camera_error = str(ui.get("camera_error", "")).strip()
             return "待命", "muted", f"相机连接失败：{camera_error}" if camera_error else "等待相机连接"
-        if detections > 0:
+        if self._detection_fresh and self.last_snapshot is not None and self.last_snapshot.boxes:
             return "● 发现目标", "warning", "正在进行目标检测"
         if waypoint > 0:
             return "● 自动巡航", "primary", "实时视觉检测中"
@@ -692,9 +711,17 @@ class DetectionDisplay(_PilRenderer):
         self.card_camera = self._make_info_row()
         self.card_waypoint = self._make_info_row()
         self.card_flight = self._make_info_row()
+        self.card_performance = self._make_info_row()
+        self.card_performance.setFont(_make_font(13))
+        self.card_performance.setStyleSheet(f"color: {_hex('muted')};")
+        self.card_drops = self._make_info_row()
+        self.card_drops.setFont(_make_font(13))
+        self.card_drops.setStyleSheet(f"color: {_hex('muted')};")
         data_layout.addWidget(self.card_camera)
         data_layout.addWidget(self.card_waypoint)
         data_layout.addWidget(self.card_flight)
+        data_layout.addWidget(self.card_performance)
+        data_layout.addWidget(self.card_drops)
         panel.addWidget(self.data_card)
 
         # ---- 巡航进度卡 ----
@@ -824,6 +851,9 @@ class DetectionDisplay(_PilRenderer):
         ui = self._cruise_ui
         if ui is None:
             return
+        if str(ui.get("flight_state", "")) in {"TAKING_OFF", "CRUISING", "STOPPING", "LANDING"}:
+            self._push_message(ui, "任务正在执行")
+            return
         if ui.get("cruise_started", False):
             self._push_message(ui, "巡航进行中")
             return
@@ -841,7 +871,12 @@ class DetectionDisplay(_PilRenderer):
         ui = self._cruise_ui
         if ui is None:
             return
-        if not ui.get("cruise_started", False):
+        if not ui.get("cruise_started", False) and str(ui.get("flight_state", "")) not in {
+            "TAKING_OFF",
+            "CRUISING",
+            "STOPPING",
+            "LANDING",
+        }:
             self._push_message(ui, "任务未在运行")
             return
         ui["stop_cruise"].set()
@@ -865,15 +900,29 @@ class DetectionDisplay(_PilRenderer):
         self._cruise_ui = ui
         if packet is not None:
             self.last_packet = packet
+            self._frame_history.append(packet)
         if snapshot is not None:
             self.last_snapshot = snapshot
-        # 帧号同步：检测结果比当前画面旧超过 2 帧视为过期，不再绘制/显示
+        # 帧号同步：检测结果必须来自已经进入显示历史的帧；未来帧、
+        # 过期帧和无法找到原图的结果都不再绘制，避免检测框错位。
+        self._detection_packet = None
         if self.last_packet is None or self.last_snapshot is None:
             self._detection_fresh = False
         else:
+            current_id = int(self.last_packet.frame_id)
+            detection_id = int(self.last_snapshot.frame_id)
+            self._detection_packet = next(
+                (
+                    history_packet
+                    for history_packet in reversed(self._frame_history)
+                    if int(history_packet.frame_id) == detection_id
+                ),
+                None,
+            )
             self._detection_fresh = (
-                int(self.last_packet.frame_id) - int(self.last_snapshot.frame_id)
-            ) <= 2
+                self._detection_packet is not None
+                and 0 <= current_id - detection_id <= 2
+            )
         if not self._window_shown:
             self._window.resize(max(960, int(args.display_width)), max(600, int(args.display_height)))
             self._window.show()
@@ -915,23 +964,43 @@ class DetectionDisplay(_PilRenderer):
         self.status_subtitle.setText(subtitle)
 
         camera_ok = bool(ui.get("camera_ok"))
-        detections = int(ui.get("detections", 0))
         index = int(ui.get("waypoint_index", 0))
         total = max(1, int(ui.get("waypoints_total", 1)))
         round_no = int(ui.get("patrol_round", 0))
         altitude = -float(ui.get("altitude", 0.0))
         speed = float(ui.get("speed", 0.0))
+        capture_fps = float(ui.get("capture_fps", 0.0))
+        detection_fps = float(ui.get("detection_fps", 0.0))
+        inference_ms = float(ui.get("inference_ms", 0.0))
+        detection_latency_ms = float(ui.get("detection_latency_ms", 0.0))
+        capture_rpc_ms = float(ui.get("capture_rpc_ms", 0.0))
+        camera_drops = int(ui.get("camera_drops", 0))
+        detection_drops = int(ui.get("detection_drops", 0))
+        boxes = (
+            self.last_snapshot.boxes
+            if self.last_snapshot is not None and self._detection_fresh
+            else ()
+        )
 
-        self.card_camera.setText(f"相机状态：{'已连接' if camera_ok else '等待连接'}    目标：{detections} 个")
+        self.card_camera.setText(
+            f"相机状态：{'已连接' if camera_ok else '等待连接'}    目标：{len(boxes)} 个"
+        )
         self.card_waypoint.setText(f"航点进度：{min(index, total):02d} / {total:02d}    第 {round_no} 圈")
         self.card_flight.setText(f"飞行高度：{altitude:.1f} 米    速度：{speed:.2f} 米/秒")
+        self.card_performance.setText(
+            f"采集：{capture_fps:.1f} 帧/秒    取图：{capture_rpc_ms:.0f} 毫秒    "
+            f"推理：{detection_fps:.1f} 帧/秒    耗时：{inference_ms:.0f} 毫秒"
+        )
+        self.card_drops.setText(
+            f"累计丢帧：相机 {camera_drops}    检测 {detection_drops}    "
+            f"延迟：{detection_latency_ms:.0f} 毫秒"
+        )
 
         self.progress.setRange(0, total)
         self.progress.setValue(min(index, total))
         self.round_label.setText(f"{min(index, total):02d} / {total:02d} · 第 {round_no} 圈")
         self.route_widget.set_progress(total, index)
 
-        boxes = self.last_snapshot.boxes if self.last_snapshot is not None else ()
         if boxes and self._detection_fresh:
             # 显示全部检测目标：按置信度降序，逐行着色
             ordered = sorted(boxes, key=lambda box: float(box[5]), reverse=True)

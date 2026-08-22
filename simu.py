@@ -25,9 +25,9 @@ landed immediately and showed no camera images"):
 - `--save-every N` writes every Nth raw camera frame to ./captures so the
   vision pipeline can be verified without looking at the GUI.
 
-Frontend: the OpenCV console window follows the reference SCD application's
-light analysis layout: a large pale-blue camera surface, a white real-time
-analysis panel, blue task actions, and compact flight metrics.
+Frontend: the PyQt6 console follows the reference SCD application's light
+analysis layout: a large pale-blue camera surface, a white real-time analysis
+panel, blue task actions, and compact flight metrics.
 """
 
 from __future__ import annotations
@@ -50,6 +50,47 @@ BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_MODEL = BASE_DIR / "visdrone-yolov26l.pt"
 DEFAULT_WAYPOINT_FILE = BASE_DIR / "waypoints.json"
 DEFAULT_CAPTURE_DIR = BASE_DIR / "captures"
+
+
+def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    """Fail early with a readable CLI error instead of failing mid-flight."""
+    errors: list[str] = []
+    if not 1 <= args.airsim_port <= 65535:
+        errors.append("--airsim-port 必须在 1 到 65535 之间")
+    if args.airsim_timeout <= 0:
+        errors.append("--airsim-timeout 必须大于 0")
+    if args.rpc_retry_limit <= 0:
+        errors.append("--rpc-retry-limit 必须大于 0")
+    if args.conf < 0 or args.conf > 1:
+        errors.append("--conf 必须在 0 到 1 之间")
+    if args.iou < 0 or args.iou > 1:
+        errors.append("--iou 必须在 0 到 1 之间")
+    if args.imgsz <= 0:
+        errors.append("--imgsz 必须大于 0")
+    if args.loops < 0:
+        errors.append("--loops 不能为负数")
+    if args.poll_interval < 0:
+        errors.append("--poll-interval 不能为负数")
+    if args.capture_fps <= 0 or args.capture_fps > 120:
+        errors.append("--capture-fps 必须大于 0 且不超过 120")
+    if args.waypoint_timeout <= 0:
+        errors.append("--waypoint-timeout 必须大于 0")
+    if args.dwell_seconds < 0:
+        errors.append("--dwell-seconds 不能为负数")
+    if args.cruise_z >= 0:
+        errors.append("--cruise-z 必须是负数（AirSim NED 坐标）")
+    if args.takeoff_z is not None and args.takeoff_z >= 0:
+        errors.append("--takeoff-z 必须是负数（AirSim NED 坐标）")
+    if args.max_speed <= 0:
+        errors.append("--max-speed 必须大于 0")
+    if args.collision_grace < 0:
+        errors.append("--collision-grace 不能为负数")
+    if args.display_width <= 0 or args.display_height <= 0:
+        errors.append("--display-width 和 --display-height 必须大于 0")
+    if args.save_every < 0 or args.save_ui_every < 0:
+        errors.append("--save-every 和 --save-ui-every 不能为负数")
+    if errors:
+        parser.error("；".join(errors))
 
 
 def parse_args() -> argparse.Namespace:
@@ -97,7 +138,13 @@ def parse_args() -> argparse.Namespace:
         "--poll-interval",
         type=float,
         default=0.10,
-        help="Seconds between image/control polls; 0.10 is about 10 FPS",
+        help="Seconds between flight telemetry polls",
+    )
+    parser.add_argument(
+        "--capture-fps",
+        type=float,
+        default=25.0,
+        help="Target camera capture rate; actual rate depends on AirSim RPC latency",
     )
     parser.add_argument(
         "--waypoint-timeout",
@@ -163,7 +210,9 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Takeoff altitude in NED coordinates; defaults to --cruise-z",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    _validate_args(parser, args)
+    return args
 
 
 def print_summary(
@@ -172,11 +221,19 @@ def print_summary(
     detector: DetectionWorker,
     worker: threading.Thread,
     worker_result: dict[str, Any],
+    ui: dict[str, Any],
 ) -> None:
     print("=" * 60)
     print("运行结束汇总：")
     print(f"  采集帧数        : {capture_worker.frames_captured}")
+    print(f"  采集帧率        : {capture_worker.capture_fps:.2f} FPS")
+    print(f"  最近取图 RPC     : {capture_worker.last_capture_rpc_ms:.2f} ms")
+    print(f"  相机丢帧数      : {capture_worker.frames_dropped}")
     print(f"  提交检测帧数    : {detector.frame_count}")
+    print(f"  检测完成帧数    : {detector.inferences_completed}")
+    print(f"  检测队列丢帧    : {detector.jobs_dropped}")
+    print(f"  最近推理耗时    : {detector.last_inference_ms:.2f} ms")
+    print(f"  飞行 RPC 失败   : {ui.get('rpc_failures', 0)}")
     print(f"  相机连接尝试    : {capture_worker.connect_attempts}")
     if detector.disabled:
         print("  [DETECTOR] 检测因连续失败已禁用（画面显示不受影响）")
@@ -221,12 +278,23 @@ def main() -> None:
         "airsim_ready": False,
         "airsim_endpoint": f"{args.airsim_ip}:{args.airsim_port}",
         "airsim_error": "",
+        "flight_state": "DISCONNECTED",
         "cruise_started": False,
         "show_detections": True,
         "start_cruise": threading.Event(),
         "stop_cruise": threading.Event(),
         "source_size": (0, 0),
         "fps": 0.0,
+        "capture_fps": 0.0,
+        "detection_fps": 0.0,
+        "inference_ms": 0.0,
+        "detection_latency_ms": 0.0,
+        "frames_dropped": 0,
+        "camera_drops": 0,
+        "detection_drops": 0,
+        "capture_rpc_ms": 0.0,
+        "rpc_failures": 0,
+        "rpc_consecutive_failures": 0,
         "messages": UIMessages(),
     }
     worker_result: dict[str, Any] = {
@@ -290,8 +358,20 @@ def main() -> None:
                 fps_window_frames = 0
                 fps_window_started = now
             ui["frames_captured"] = capture_worker.frames_captured
+            ui["capture_fps"] = capture_worker.capture_fps
+            ui["detection_fps"] = detector.inference_fps
+            ui["inference_ms"] = detector.last_inference_ms
+            ui["camera_drops"] = capture_worker.frames_dropped
+            ui["detection_drops"] = detector.jobs_dropped
+            ui["frames_dropped"] = capture_worker.frames_dropped + detector.jobs_dropped
+            ui["capture_rpc_ms"] = capture_worker.last_capture_rpc_ms
             if snapshot is not None:
                 ui["detections"] = len(snapshot.boxes)
+                if snapshot.submitted_monotonic > 0:
+                    ui["detection_latency_ms"] = max(
+                        0.0,
+                        (time.monotonic() - snapshot.submitted_monotonic) * 1000.0,
+                    )
 
             # Surface worker errors in the UI once
             if capture_worker.error is not None and "camera" not in notified:
@@ -342,6 +422,7 @@ def main() -> None:
             detector=detector,
             worker=worker,
             worker_result=worker_result,
+            ui=ui,
         )
 
 

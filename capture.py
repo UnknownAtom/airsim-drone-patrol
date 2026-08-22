@@ -99,8 +99,11 @@ class CaptureWorker:
         self.started_monotonic = started_monotonic
         self.error: Exception | None = None
         self.last_image_error: str | None = None
+        self.last_capture_rpc_ms = 0.0
         self.frames_captured = 0
+        self.frames_dropped = 0
         self.connect_attempts = 0
+        self._fps_started = 0.0
         self.done_event = threading.Event()
         self._save_warned: str | None = None
         self.thread = threading.Thread(target=self._run, name="airsim-camera", daemon=True)
@@ -152,10 +155,18 @@ class CaptureWorker:
         if camera_client is None:
             self.done_event.set()
             return
+        self._fps_started = time.monotonic()
+        capture_interval = 1.0 / self.args.capture_fps
+        next_capture_at = time.monotonic()
         consecutive_failures = 0
         try:
             while not self.stop_event.is_set():
+                wait_seconds = next_capture_at - time.monotonic()
+                if wait_seconds > 0 and self.stop_event.wait(wait_seconds):
+                    break
+                rpc_started = time.perf_counter()
                 frame, error = get_scene_frame(camera_client, self.args.camera)
+                self.last_capture_rpc_ms = (time.perf_counter() - rpc_started) * 1000.0
                 if frame is None:
                     consecutive_failures += 1
                     with self.state_lock:
@@ -172,7 +183,9 @@ class CaptureWorker:
                         if camera_client is None:
                             break
                         consecutive_failures = 0
-                    time.sleep(max(0.02, self.args.poll_interval))
+                    if self.stop_event.wait(max(0.02, capture_interval)):
+                        break
+                    next_capture_at = time.monotonic()
                     continue
 
                 consecutive_failures = 0
@@ -191,11 +204,17 @@ class CaptureWorker:
                     waypoint_index=waypoint_index,
                     started_monotonic=self.started_monotonic,
                 )
-                put_latest(self.frame_queue, FramePacket(frame, frame_id))
+                if put_latest(self.frame_queue, FramePacket(frame, frame_id)):
+                    self.frames_dropped += 1
                 self._maybe_save_frame(frame, frame_id)
                 if self.args.debug and frame_id % 10 == 0:
                     print(f"[DEBUG] capture frame_id={frame_id}")
-                time.sleep(max(0.0, self.args.poll_interval))
+                next_capture_at += capture_interval
+                now = time.monotonic()
+                if next_capture_at < now:
+                    # RPC or downstream processing exceeded one frame period;
+                    # skip the missed slot instead of building a backlog.
+                    next_capture_at = now
         except Exception as exc:
             self.error = exc
             print(f"[CAMERA] 相机线程异常退出: {type(exc).__name__}: {exc}")
@@ -229,13 +248,30 @@ class CaptureWorker:
         self.stop_event.set()
         self.thread.join(timeout=10.0)
 
+    @property
+    def capture_fps(self) -> float:
+        if self._fps_started <= 0:
+            return 0.0
+        elapsed = time.monotonic() - self._fps_started
+        if elapsed < 0.1:
+            return 0.0
+        return self.frames_captured / elapsed
 
-def put_latest(target: queue.Queue[FramePacket], packet: FramePacket) -> None:
+
+def put_latest(target: queue.Queue[FramePacket], packet: FramePacket) -> bool:
+    """Put a packet while keeping only the newest one.
+
+    Returns True when an older packet had to be discarded. This is intentional
+    for a live view, but the counter is useful for diagnosing a slow GUI.
+    """
+    dropped = False
     try:
         target.get_nowait()
+        dropped = True
     except queue.Empty:
         pass
     try:
         target.put_nowait(packet)
     except queue.Full:
-        pass
+        dropped = True
+    return dropped

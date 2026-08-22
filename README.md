@@ -6,6 +6,8 @@
 
 - **多航点巡航**：JSON 配置航点，支持多圈巡航、X/Y 分轴移动、速度与高度钳制
 - **目标检测**：默认 VisDrone 预训练权重（行人/车辆等 11 类），兼容 YOLOv5 与 Ultralytics 两种模型格式
+- **稳定性保护**：飞行状态机、RPC 连续失败计数、停止/降落状态显示和启动参数校验
+- **实时诊断**：显示采集 FPS、推理 FPS、推理耗时、检测延迟和丢帧数量
 - **调试参数支持**：`--save-every` / `--save-ui-every` 保存原始帧与界面帧，`--debug` 输出帧率诊断等等
 
 ## 架构
@@ -48,6 +50,7 @@ python simu.py --device 0
 | `--model` | `visdrone-yolov26l.pt` | 模型路径（Ultralytics 或 其他格式） |
 | `--conf` / `--iou` | `0.35` / `0.45` | 置信度 / NMS IoU 阈值 |
 | `--imgsz` | `640` | YOLO 推理尺寸 |
+| `--capture-fps` | `25` | 相机目标采集帧率，实际值受 AirSim RPC 延迟限制 |
 | `--waypoints-file` | `waypoints.json` | 航点配置文件 |
 | `--loops` | `1` | 巡航圈数，`0` 表示持续巡航 |
 | `--cruise-z` | `-15` | 巡航高度（NED 坐标，负值向上） |
