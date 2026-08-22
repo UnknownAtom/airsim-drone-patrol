@@ -68,22 +68,24 @@ def _display_name(name: str) -> str:
     return DISPLAY_NAME_MAP.get(str(name).strip().lower(), str(name))
 
 
-# 调色板：浅蓝预览面 + 深蓝主操作色的视觉锚点
+# MD3（Material Design 3）蓝色系浅色色板。
+# PIL 视频区（预览面/HUD/检测框）与 Qt 面板共用，键名保持兼容。
 COLORS: dict[str, tuple[int, int, int]] = {
-    "bg": (242, 242, 247),
-    "surface": (255, 255, 255),
-    "preview": (206, 229, 237),
-    "primary": (50, 76, 180),
-    "primary_soft": (238, 241, 251),
-    "text": (26, 26, 46),
-    "muted": (92, 96, 112),
-    "muted_light": (118, 121, 136),
-    "border": (225, 226, 235),
-    "soft_gray": (242, 242, 247),
-    "soft_blue": (238, 241, 251),
-    "success": (56, 142, 60),
-    "warning": (211, 47, 47),
-    "warning_soft": (252, 235, 235),
+    "bg": (253, 252, 255),            # surface
+    "surface": (255, 255, 255),       # surfaceContainerLowest
+    "preview": (207, 229, 255),       # primaryContainer（视频区淡蓝）
+    "primary": (0, 97, 164),          # primary（M3 Blue）
+    "primary_soft": (207, 229, 255),  # primaryContainer
+    "text": (25, 28, 32),             # onSurface
+    "muted": (68, 71, 78),            # onSurfaceVariant
+    "muted_light": (117, 119, 127),   # outline
+    "border": (196, 199, 207),        # outlineVariant
+    "soft_gray": (241, 244, 250),     # surfaceContainer
+    "soft_blue": (214, 227, 247),     # secondaryContainer
+    "surface_high": (229, 233, 240),  # surfaceContainerHighest（进度轨道）
+    "success": (59, 125, 63),
+    "warning": (186, 26, 26),         # error
+    "warning_soft": (255, 218, 214),  # errorContainer
     "white": (255, 255, 255),
     "image_border": (255, 255, 255),
 }
@@ -469,6 +471,15 @@ def _hover_hex(name: str, factor: float = 1.1) -> str:
     return f"#{r:02X}{g:02X}{b:02X}"
 
 
+def _mix_white(name: str, alpha: float) -> str:
+    """MD3 状态层：在底色上叠加半透明白（hover 8% / pressed 12%）。"""
+    r, g, b = COLORS[name]
+    r = int(r + (255 - r) * alpha)
+    g = int(g + (255 - g) * alpha)
+    b = int(b + (255 - b) * alpha)
+    return f"#{r:02X}{g:02X}{b:02X}"
+
+
 def _pick_font(candidates: tuple[str, ...]) -> str:
     families = set(QFontDatabase.families())
     for name in candidates:
@@ -551,6 +562,10 @@ class StatusStrip(QWidget):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self.setObjectName("statusStrip")
+        self.setStyleSheet(
+            f"#statusStrip {{ background: {_hex('surface')}; border-radius: 16px; }}"
+        )
         self._labels: dict[str, QLabel] = {}
         layout = QHBoxLayout(self)
         layout.setContentsMargins(18, 10, 18, 10)
@@ -630,14 +645,14 @@ class DetectionDisplay(_PilRenderer):
         root = QWidget()
         self._window.setCentralWidget(root)
         root_layout = QHBoxLayout(root)
-        root_layout.setContentsMargins(14, 14, 14, 14)
-        root_layout.setSpacing(14)
+        root_layout.setContentsMargins(16, 16, 16, 16)
+        root_layout.setSpacing(16)
 
         # ---- 左侧视频区 ----
         self.video_label = QLabel()
         self.video_label.setMinimumSize(320, 240)
         self.video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.video_label.setStyleSheet(f"background: {_hex('preview')}; border-radius: 12px;")
+        self.video_label.setStyleSheet(f"background: {_hex('preview')}; border-radius: 20px;")
         root_layout.addWidget(self.video_label, stretch=7)
 
         # ---- 右侧面板 ----
@@ -653,114 +668,135 @@ class DetectionDisplay(_PilRenderer):
         self.right_panel = QWidget()
         panel = QVBoxLayout(self.right_panel)
         panel.setContentsMargins(0, 0, 0, 0)
-        panel.setSpacing(12)
+        panel.setSpacing(16)
 
-        # 状态标题区
+        # ---- 状态卡 ----
+        self.status_card = self._make_md3_card(fill="surface")
+        status_layout = self.status_card.layout()
         self.status_title = QLabel("● 监测中")
-        self.status_title.setFont(_make_font(26, 700))
+        self.status_title.setFont(_make_font(24, 700))
         self.status_title.setStyleSheet(f"color: {_hex('success')};")
         self.status_subtitle = QLabel("相机已连接")
         self.status_subtitle.setFont(_make_font(13))
         self.status_subtitle.setStyleSheet(f"color: {_hex('muted')};")
         self.status_subtitle.setWordWrap(True)
         self.status_subtitle.setMaximumHeight(42)
-        panel.addWidget(self.status_title)
-        panel.addWidget(self.status_subtitle)
+        status_layout.addWidget(self.status_title)
+        status_layout.addWidget(self.status_subtitle)
+        panel.addWidget(self.status_card)
 
-        # 信息卡片（3 行）
-        self.card_camera = self._make_card()
-        self.card_waypoint = self._make_card()
-        self.card_flight = self._make_card()
-        panel.addWidget(self.card_camera)
-        panel.addWidget(self.card_waypoint)
-        panel.addWidget(self.card_flight)
+        # ---- 飞行数据卡 ----
+        self.data_card = self._make_md3_card()
+        data_layout = self.data_card.layout()
+        self.card_camera = self._make_info_row()
+        self.card_waypoint = self._make_info_row()
+        self.card_flight = self._make_info_row()
+        data_layout.addWidget(self.card_camera)
+        data_layout.addWidget(self.card_waypoint)
+        data_layout.addWidget(self.card_flight)
+        panel.addWidget(self.data_card)
 
-        # 巡航进度
+        # ---- 巡航进度卡 ----
+        self.progress_card = self._make_md3_card()
+        progress_layout = self.progress_card.layout()
         progress_row = QHBoxLayout()
         progress_row.setSpacing(10)
         progress_caption = QLabel("巡航进度")
         progress_caption.setFont(_make_font(13))
         progress_caption.setStyleSheet(f"color: {_hex('muted')};")
-        self.round_label = QLabel("第 0 圈")
+        self.round_label = QLabel("0 / 1 · 第 0 圈")
         self.round_label.setFont(_make_font(13))
         self.round_label.setStyleSheet(f"color: {_hex('muted')};")
         self.progress = QProgressBar()
         self.progress.setRange(0, 1)
         self.progress.setValue(0)
-        self.progress.setTextVisible(True)
-        self.progress.setFixedHeight(14)
+        self.progress.setTextVisible(False)
+        self.progress.setFixedHeight(4)
         self.progress.setStyleSheet(
-            f"QProgressBar {{ background: {_hex('primary_soft')}; border: none;"
-            f" border-radius: 3px; color: {_hex('muted')}; font-size: 10px; }}"
-            f"QProgressBar::chunk {{ background: {_hex('primary')}; border-radius: 3px; }}"
+            f"QProgressBar {{ background: {_hex('surface_high')}; border: none;"
+            f" border-radius: 2px; }}"
+            f"QProgressBar::chunk {{ background: {_hex('primary')}; border-radius: 2px; }}"
         )
         progress_row.addWidget(progress_caption)
         progress_row.addWidget(self.progress, stretch=1)
         progress_row.addWidget(self.round_label)
-        panel.addLayout(progress_row)
-
-        # 航点路线
+        progress_layout.addLayout(progress_row)
         self.route_widget = RouteWidget()
-        panel.addWidget(self.route_widget)
+        progress_layout.addWidget(self.route_widget)
+        panel.addWidget(self.progress_card)
 
-        # 当前目标（显示全部检测目标；固定高度 + 滚动，避免目标过多拉长面板）
+        # ---- 目标卡（全部检测目标；固定高度 + 滚动，避免目标过多拉长面板）----
+        self.target_card = self._make_md3_card()
+        target_layout = self.target_card.layout()
+        target_title = QLabel("检测目标")
+        target_title.setFont(_make_font(13))
+        target_title.setStyleSheet(f"color: {_hex('muted')};")
+        target_layout.addWidget(target_title)
         self.target_scroll = QScrollArea()
         self.target_scroll.setWidgetResizable(True)
-        self.target_scroll.setFixedHeight(150)
+        self.target_scroll.setFixedHeight(140)
         self.target_scroll.setFrameShape(QFrame.Shape.NoFrame)
         self.target_scroll.setStyleSheet(
             "QScrollArea { background: transparent; border: none; }"
-            "QScrollBar:vertical { background: transparent; width: 8px; margin: 0; }"
-            "QScrollBar::handle:vertical { background: #C9CBD6; border-radius: 4px;"
-            " min-height: 20px; }"
+            "QScrollBar:vertical { background: transparent; width: 6px; margin: 0; }"
+            f"QScrollBar::handle:vertical {{ background: {_hex('border')};"
+            " border-radius: 3px; min-height: 20px; }"
             "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }"
         )
         self.target_label = QLabel("当前画面没有检测目标")
         self.target_label.setFont(_make_font(15))
         self.target_label.setWordWrap(True)
-        self.target_label.setStyleSheet(
-            f"background: {_hex('soft_gray')}; border-radius: 10px; padding: 12px;"
-            f" color: {_hex('muted_light')};"
-        )
+        self.target_label.setStyleSheet(f"color: {_hex('muted_light')};")
         self.target_scroll.setWidget(self.target_label)
-        panel.addWidget(self.target_scroll)
+        target_layout.addWidget(self.target_scroll)
+        panel.addWidget(self.target_card)
 
         panel.addStretch(1)
 
-        # 操作按钮（绑定真实控制：巡航启停 / 检测框显示开关）
+        # ---- 操作卡（按钮绑定真实控制：巡航启停 / 检测框显示开关）----
+        self.action_card = self._make_md3_card(fill="surface")
+        action_layout = self.action_card.layout()
         self.btn_cruise = self._make_button("多航点巡航")
         self.btn_detect = self._make_button("实时视觉检测")
         self.btn_stop = self._make_button("停止任务", danger=True)
         self.btn_cruise.clicked.connect(self._on_cruise_clicked)
         self.btn_detect.clicked.connect(self._on_detect_clicked)
         self.btn_stop.clicked.connect(self._on_stop_clicked)
-        panel.addWidget(self.btn_cruise)
-        panel.addWidget(self.btn_detect)
-        panel.addWidget(self.btn_stop)
+        action_layout.addWidget(self.btn_cruise)
+        action_layout.addWidget(self.btn_detect)
+        action_layout.addWidget(self.btn_stop)
+        panel.addWidget(self.action_card)
         self._cruise_ui = None
 
-    def _make_card(self) -> QLabel:
-        label = QLabel("—")
-        label.setFont(_make_font(15))
-        label.setStyleSheet(
-            f"background: {_hex('soft_gray')}; border-radius: 12px; padding: 14px;"
-            f" color: {_hex('text')};"
+    def _make_md3_card(self, fill: str = "soft_gray") -> QFrame:
+        """MD3 FilledCard：圆角 20px + 布局内边距（QSS padding 对 QFrame 无效）。"""
+        card = QFrame()
+        card.setStyleSheet(
+            f"QFrame {{ background: {_hex(fill)}; border: none; border-radius: 20px; }}"
         )
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(10)
+        return card
+
+    def _make_info_row(self, text: str = "—") -> QLabel:
+        label = QLabel(text)
+        label.setFont(_make_font(15))
+        label.setStyleSheet(f"color: {_hex('text')};")
         return label
 
     def _make_button(self, text: str, danger: bool = False) -> QPushButton:
         button = QPushButton(text)
         button.setCursor(Qt.CursorShape.PointingHandCursor)
-        button.setFixedHeight(46)
-        if danger:
-            base, hover = _hex("warning"), _hover_hex("warning")
-        else:
-            base, hover = _hex("primary"), _hover_hex("primary")
+        button.setFixedHeight(48)
+        base = _hex("warning") if danger else _hex("primary")
+        hover = _mix_white("warning", 0.08) if danger else _mix_white("primary", 0.08)
+        pressed = _mix_white("warning", 0.12) if danger else _mix_white("primary", 0.12)
         button.setStyleSheet(
             f"QPushButton {{ background: {base}; color: white;"
-            f" border: none; border-radius: 8px; font-size: 15px; font-weight: 700; }}"
+            f" border: none; border-radius: 24px; font-size: 15px; font-weight: 700; }}"
             f"QPushButton:hover {{ background: {hover}; }}"
-            f"QPushButton:pressed {{ background: {base}; }}"
+            f"QPushButton:pressed {{ background: {pressed}; }}"
         )
         return button
 
@@ -884,7 +920,7 @@ class DetectionDisplay(_PilRenderer):
 
         self.progress.setRange(0, total)
         self.progress.setValue(min(index, total))
-        self.round_label.setText(f"第 {round_no} 圈")
+        self.round_label.setText(f"{min(index, total):02d} / {total:02d} · 第 {round_no} 圈")
         self.route_widget.set_progress(total, index)
 
         boxes = self.last_snapshot.boxes if self.last_snapshot is not None else ()
@@ -903,17 +939,12 @@ class DetectionDisplay(_PilRenderer):
             self.target_label.setText("<br>".join(lines))
             self.target_label.setTextFormat(Qt.TextFormat.RichText)
             self.target_label.setWordWrap(True)
-            self.target_label.setStyleSheet(
-                f"background: {_hex('soft_gray')}; border-radius: 10px; padding: 12px;"
-            )
+            self.target_label.setStyleSheet("")
         else:
             self.target_label.setText("当前画面没有检测目标")
             self.target_label.setTextFormat(Qt.TextFormat.PlainText)
             self.target_label.setWordWrap(True)
-            self.target_label.setStyleSheet(
-                f"background: {_hex('soft_gray')}; border-radius: 10px; padding: 12px;"
-                f" color: {_hex('muted_light')};"
-            )
+            self.target_label.setStyleSheet(f"color: {_hex('muted_light')};")
 
         self.status_strip.set_values(ui)
 
