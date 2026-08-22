@@ -14,7 +14,6 @@ import argparse
 import queue
 import threading
 import time
-import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -68,9 +67,6 @@ class DetectorBackend:
         self.use_half = self._resolve_half()
         self.model_load_ms = 0.0
         self.warmup_ms = 0.0
-        # ultralytics 的 half 参数在 8.x 会发 deprecation 警告；只在加载时设置一次，
-        # 避免每次推理都创建 catch_warnings 上下文。
-        warnings.filterwarnings("ignore", message=r".*'half' is deprecated.*")
         load_started = time.perf_counter()
 
         if self.is_yolov5:
@@ -137,7 +133,10 @@ class DetectorBackend:
             "iou": self.args.iou,
             "imgsz": self.args.imgsz,
             "device": self.device,
-            "half": self.use_half,
+            # Ultralytics 8.4+ renamed the precision option from ``half`` to
+            # ``quantize``.  16 means FP16; None keeps the normal FP32 path.
+            # Using the new key avoids a deprecation log on every frame.
+            "quantize": 16 if self.use_half else None,
             "verbose": False,
         }
         return self.model.predict(**options)
