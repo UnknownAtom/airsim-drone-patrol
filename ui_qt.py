@@ -318,7 +318,6 @@ class _PilRenderer:
         canvas: Image.Image,
         draw: ImageDraw.ImageDraw,
         box: tuple[int, int, int, int],
-        ui: dict[str, Any],
     ) -> None:
         x1, y1, x2, y2 = box
         _rounded(draw, box, self.scheme["surface"], radius=28)
@@ -371,7 +370,6 @@ class _PilRenderer:
         if (
             self.last_snapshot is not None
             and self._detection_fresh
-            and ui.get("show_detections", True)
         ):
             for (
                 xmin,
@@ -467,7 +465,7 @@ class _PilRenderer:
         if flight_state == "LANDING":
             return "正在降落", "primary", "执行安全降落"
         if not ui.get("cruise_started", False):
-            return "系统待命", "primary", "点击下方“多航点巡航”开始"
+            return "系统待命", "primary", "等待自动起飞"
         if not camera_ok:
             camera_error = str(ui.get("camera_error", "")).strip()
             return (
@@ -693,22 +691,26 @@ class DetectionDisplay(_PilRenderer):
         status_layout.addWidget(self.status_subtitle)
         panel.addWidget(self.status_card)
 
-        # 2. 核心指标 2x2 网格小卡片
+        # 2. 核心性能指标 2x3 网格小卡片
         grid_widget = QWidget()
         grid = QGridLayout(grid_widget)
         grid.setContentsMargins(0, 0, 0, 0)
         grid.setHorizontalSpacing(10)
         grid.setVerticalSpacing(10)
 
-        self.tile_alt = MetricTile("飞行高度", "m")
-        self.tile_spd = MetricTile("飞行速度", "m/s")
-        self.tile_fps = MetricTile("推理帧率", "fps")
-        self.tile_lat = MetricTile("系统延迟", "ms")
+        self.tile_capture = MetricTile("采集帧率", "fps")
+        self.tile_rpc = MetricTile("取图耗时", "ms")
+        self.tile_inference = MetricTile("推理帧率", "fps")
+        self.tile_yolo = MetricTile("YOLO 耗时", "ms")
+        self.tile_gui = MetricTile("GUI 帧率", "fps")
+        self.tile_drops = MetricTile("丢帧（相机/检测）")
 
-        grid.addWidget(self.tile_alt, 0, 0)
-        grid.addWidget(self.tile_spd, 0, 1)
-        grid.addWidget(self.tile_fps, 1, 0)
-        grid.addWidget(self.tile_lat, 1, 1)
+        grid.addWidget(self.tile_capture, 0, 0)
+        grid.addWidget(self.tile_rpc, 0, 1)
+        grid.addWidget(self.tile_inference, 1, 0)
+        grid.addWidget(self.tile_yolo, 1, 1)
+        grid.addWidget(self.tile_gui, 2, 0)
+        grid.addWidget(self.tile_drops, 2, 1)
         panel.addWidget(grid_widget)
 
         # 3. 巡航进度卡片
@@ -778,16 +780,10 @@ class DetectionDisplay(_PilRenderer):
         self.action_card = self._make_card(radius=24)
         action_layout = self.action_card.layout()
 
-        self.btn_cruise = self._make_button("多航点巡航", primary=True)
-        self.btn_detect = self._make_button("实时视觉检测", primary=False)
         self.btn_stop = self._make_button("停止任务", danger=True)
 
-        self.btn_cruise.clicked.connect(self._on_cruise_clicked)
-        self.btn_detect.clicked.connect(self._on_detect_clicked)
         self.btn_stop.clicked.connect(self._on_stop_clicked)
 
-        action_layout.addWidget(self.btn_cruise)
-        action_layout.addWidget(self.btn_detect)
         action_layout.addWidget(self.btn_stop)
         panel.addWidget(self.action_card)
 
@@ -853,31 +849,6 @@ class DetectionDisplay(_PilRenderer):
     def _push_message(self, text: str) -> None:
         print(f"[UI] {text}")
 
-    def _on_cruise_clicked(self) -> None:
-        ui = self._cruise_ui
-        if ui is None:
-            return
-        if str(ui.get("flight_state", "")) in {
-            "TAKING_OFF",
-            "CRUISING",
-            "STOPPING",
-            "LANDING",
-        }:
-            self._push_message("任务正在执行中")
-            return
-        if ui.get("cruise_started", False):
-            self._push_message("巡航运行中")
-            return
-        if not ui.get("airsim_connected", False):
-            self._push_message("等待 AirSim 连接中")
-            return
-        ui["start_cruise"].set()
-        ui["stop_cruise"].clear()
-        if ui.get("airsim_ready", False):
-            self._push_message("发送巡航指令，即将起飞")
-        else:
-            self._push_message("场景就绪后自动起飞")
-
     def _on_stop_clicked(self) -> None:
         ui = self._cruise_ui
         if ui is None:
@@ -894,14 +865,6 @@ class DetectionDisplay(_PilRenderer):
             return
         ui["stop_cruise"].set()
         self._push_message("停止巡航并准备降落…")
-
-    def _on_detect_clicked(self) -> None:
-        ui = self._cruise_ui
-        if ui is None:
-            return
-        show = not ui.get("show_detections", True)
-        ui["show_detections"] = show
-        self._push_message(f"检测框显示已{'开启' if show else '关闭'}")
 
     # ------------------------------------------------------------------
     # 渲染与更新
@@ -948,7 +911,7 @@ class DetectionDisplay(_PilRenderer):
             self._window_shown = True
 
         render_started = time.perf_counter()
-        self._render_video(ui, save_render=int(getattr(args, "save_ui_every", 0)) > 0)
+        self._render_video(save_render=int(getattr(args, "save_ui_every", 0)) > 0)
         self._update_panel(ui)
         render_ms = (time.perf_counter() - render_started) * 1000.0
         self.render_stats.add(render_ms)
@@ -966,13 +929,13 @@ class DetectionDisplay(_PilRenderer):
             self._last_event_pump = now
         return self._quit_requested
 
-    def _render_video(self, ui: dict[str, Any], *, save_render: bool = False) -> None:
+    def _render_video(self, *, save_render: bool = False) -> None:
         size = self.video_label.size()
         width = max(320, size.width())
         height = max(240, size.height())
         canvas = Image.new("RGBA", (width, height), (*COLORS["bg"], 255))
         draw = ImageDraw.Draw(canvas, "RGBA")
-        self._draw_preview(canvas, draw, (0, 0, width, height), ui)
+        self._draw_preview(canvas, draw, (0, 0, width, height))
 
         rgb = np.asarray(canvas.convert("RGB"))
         qimage = QImage(
@@ -1002,10 +965,15 @@ class DetectionDisplay(_PilRenderer):
         index = int(ui.get("waypoint_index", 0))
         total = max(1, int(ui.get("waypoints_total", 1)))
         round_no = int(ui.get("patrol_round", 0))
-        altitude = -float(ui.get("altitude", 0.0))
-        speed = float(ui.get("speed", 0.0))
+        capture_fps = float(ui.get("capture_fps", 0.0))
+        capture_rpc_avg_ms = float(ui.get("capture_rpc_avg_ms", 0.0))
+        capture_rpc_max_ms = float(ui.get("capture_rpc_max_ms", 0.0))
         detection_fps = float(ui.get("detection_fps", 0.0))
-        detection_latency_ms = float(ui.get("detection_latency_ms", 0.0))
+        detection_avg_ms = float(ui.get("detection_avg_ms", 0.0))
+        detection_max_ms = float(ui.get("detection_max_ms", 0.0))
+        render_fps = float(ui.get("render_fps", 0.0))
+        camera_drops = int(ui.get("camera_drops", 0))
+        detection_drops = int(ui.get("detection_drops", 0))
 
         boxes = (
             self.last_snapshot.boxes
@@ -1013,10 +981,12 @@ class DetectionDisplay(_PilRenderer):
             else ()
         )
         # 小卡片赋值
-        self.tile_alt.set_value(f"{altitude:.1f}")
-        self.tile_spd.set_value(f"{speed:.2f}")
-        self.tile_fps.set_value(f"{detection_fps:.1f}")
-        self.tile_lat.set_value(f"{detection_latency_ms:.0f}")
+        self.tile_capture.set_value(f"{capture_fps:.1f}")
+        self.tile_rpc.set_value(f"{capture_rpc_avg_ms:.0f}/{capture_rpc_max_ms:.0f}")
+        self.tile_inference.set_value(f"{detection_fps:.1f}")
+        self.tile_yolo.set_value(f"{detection_avg_ms:.0f}/{detection_max_ms:.0f}")
+        self.tile_gui.set_value(f"{render_fps:.1f}")
+        self.tile_drops.set_value(f"{camera_drops}/{detection_drops}")
 
         # 进度更新
         self.progress.setRange(0, total)

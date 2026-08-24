@@ -146,11 +146,7 @@ def poll_flight(
     """Fetch telemetry, refresh the display state, and return target distance."""
     state = client.getMultirotorState()
     position = state.kinematics_estimated.position
-    velocity = state.kinematics_estimated.linear_velocity
     x, y, z = float(position.x_val), float(position.y_val), float(position.z_val)
-    with state_lock:
-        ui["altitude"] = z
-        ui["speed"] = math.hypot(float(velocity.x_val), float(velocity.y_val))
     return math.sqrt((x - target.x) ** 2 + (y - target.y) ** 2 + (z - target.z) ** 2)
 
 
@@ -181,11 +177,6 @@ def _wait_for_state(
             return False
         try:
             state = client.getMultirotorState()
-            position = state.kinematics_estimated.position
-            velocity = state.kinematics_estimated.linear_velocity
-            with state_lock:
-                ui["altitude"] = float(position.z_val)
-                ui["speed"] = math.hypot(float(velocity.x_val), float(velocity.y_val))
             if predicate(state):
                 return True
         except Exception as exc:
@@ -483,9 +474,6 @@ def _prepare_initial_session(
         ui["airsim_ready"] = True
         ui["airsim_error"] = ""
     set_flight_state(ui, state_lock, "READY")
-    # A click made while the first automatic patrol was starting must not
-    # become an implicit second patrol after the first landing.
-    ui["start_cruise"].clear()
     return True
 
 
@@ -656,7 +644,7 @@ def _takeoff(
     ui: dict[str, Any],
     state_lock: threading.Lock,
 ) -> bool:
-    """起飞并爬升至巡航高度（首次与“重新开始”复用）。"""
+    """起飞并爬升至巡航高度。"""
     if stop_event.is_set() or ui["stop_cruise"].is_set():
         return False
     set_flight_state(ui, state_lock, "TAKING_OFF")
@@ -749,8 +737,8 @@ def flight_worker(
 ) -> None:
     """Own all AirSim RPC calls so the GUI thread can never block on AirSim.
 
-    任务循环：首次连接/就绪后自动起飞巡航；巡航可被“停止任务”按钮
-    中断（降落并回到待命），再点“多航点巡航”可重新开始；Q 键完全退出。
+    首次连接/就绪后自动起飞巡航；巡航可被“停止任务”按钮中断，
+    安全降落后结束本次任务；Q 键完全退出。
     """
     client: airsim.MultirotorClient | None = None
     api_control = False
@@ -788,19 +776,7 @@ def flight_worker(
         api_control = True
 
         monitor = CollisionMonitor(client, grace_seconds=args.collision_grace)
-        first_run = True
         while not stop_event.is_set():
-            # 等待开始指令：首次自动开始；停止后等待“多航点巡航”按钮
-            if not first_run:
-                set_flight_state(ui, state_lock, "READY")
-                print("[FLIGHT] 任务待命：点击“多航点巡航”开始巡航")
-                while not ui["start_cruise"].wait(0.2) and not stop_event.is_set():
-                    pass
-                ui["start_cruise"].clear()
-                if stop_event.is_set():
-                    break
-            first_run = False
-
             landed = False
             client, took_off = _takeoff_with_recovery(
                 client,
@@ -863,7 +839,7 @@ def flight_worker(
                 if cruise_aborted:
                     break
 
-            # 本次巡航结束：降落，回到待命
+            # 本次巡航结束：降落并结束本次任务。
             landed = _land_safely(
                 client,
                 stop_event=stop_event,
@@ -875,7 +851,8 @@ def flight_worker(
             if result["error"] is None and not stop_event.is_set():
                 set_flight_state(ui, state_lock, "READY")
             if not stop_event.is_set():
-                print("[FLIGHT] 巡航结束，已降落；等待“多航点巡航”重新开始")
+                print("[FLIGHT] 巡航结束，已降落；任务即将结束")
+            break
     except Exception as exc:
         result["error"] = exc
         set_flight_state(ui, state_lock, "ERROR")

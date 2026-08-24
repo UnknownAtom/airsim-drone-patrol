@@ -303,8 +303,6 @@ def main() -> None:
     done_event = threading.Event()
     state_lock = threading.Lock()
     ui: dict[str, Any] = {
-        "altitude": 0.0,
-        "speed": 0.0,
         "patrol_round": 0,
         "waypoint_index": 0,
         "waypoints_total": len(waypoints),
@@ -315,11 +313,16 @@ def main() -> None:
         "airsim_error": "",
         "flight_state": "DISCONNECTED",
         "cruise_started": False,
-        "show_detections": True,
-        "start_cruise": threading.Event(),
         "stop_cruise": threading.Event(),
+        "capture_fps": 0.0,
         "detection_fps": 0.0,
-        "detection_latency_ms": 0.0,
+        "capture_rpc_avg_ms": 0.0,
+        "capture_rpc_max_ms": 0.0,
+        "detection_avg_ms": 0.0,
+        "detection_max_ms": 0.0,
+        "render_fps": 0.0,
+        "camera_drops": 0,
+        "detection_drops": 0,
         "rpc_failures": 0,
     }
     worker_result: dict[str, Any] = {
@@ -370,10 +373,20 @@ def main() -> None:
                 print(f"[DEBUG] detect frame_id={snapshot.frame_id}")
 
             # Refresh only values consumed by the Qt panel.
+            ui["capture_fps"] = capture_worker.capture_fps
             ui["detection_fps"] = detector.inference_fps
-            ui["detection_latency_ms"] = detector.last_latency_ms
-            if snapshot is not None:
-                ui["detection_latency_ms"] = snapshot.latency_ms or detector.last_latency_ms
+            ui["camera_drops"] = capture_worker.frames_dropped
+            ui["detection_drops"] = detector.jobs_dropped
+            capture_perf = capture_worker.performance_snapshot()
+            capture_rpc = capture_perf["rpc"]
+            ui["capture_rpc_avg_ms"] = capture_rpc.average_ms
+            ui["capture_rpc_max_ms"] = capture_rpc.maximum_ms
+            detector_perf = detector.performance_snapshot
+            inference = detector_perf["inference"]
+            ui["detection_avg_ms"] = inference.average_ms
+            ui["detection_max_ms"] = inference.maximum_ms
+            if not args.no_display:
+                ui["render_fps"] = display.render_fps
 
             if raw_frame is not None or snapshot is not None:
                 should_quit = display.show(raw_frame, snapshot, args, ui)
