@@ -44,7 +44,7 @@ import cv2
 from capture import CaptureWorker, FramePacket
 from detector import DetectorBackend, DetectionWorker
 from flight import flight_worker, load_waypoints, normalize_waypoints
-from ui_qt import DetectionDisplay, UIMessages
+from ui_qt import DetectionDisplay
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_MODEL = BASE_DIR / "visdrone-yolov26l.pt"
@@ -303,15 +303,11 @@ def main() -> None:
     done_event = threading.Event()
     state_lock = threading.Lock()
     ui: dict[str, Any] = {
-        "position": (0.0, 0.0, 0.0),
         "altitude": 0.0,
         "speed": 0.0,
         "patrol_round": 0,
         "waypoint_index": 0,
         "waypoints_total": len(waypoints),
-        "waypoints": tuple((waypoint.x, waypoint.y) for waypoint in waypoints),
-        "frames_captured": 0,
-        "detections": 0,
         "camera_ok": False,
         "camera_error": "",
         "airsim_connected": False,
@@ -322,24 +318,9 @@ def main() -> None:
         "show_detections": True,
         "start_cruise": threading.Event(),
         "stop_cruise": threading.Event(),
-        "capture_fps": 0.0,
         "detection_fps": 0.0,
-        "inference_ms": 0.0,
         "detection_latency_ms": 0.0,
-        "camera_drops": 0,
-        "detection_drops": 0,
-        "capture_rpc_ms": 0.0,
-        "capture_rpc_avg_ms": 0.0,
-        "capture_rpc_max_ms": 0.0,
-        "image_parse_avg_ms": 0.0,
-        "image_parse_max_ms": 0.0,
-        "detection_avg_ms": 0.0,
-        "detection_max_ms": 0.0,
-        "detection_latency_avg_ms": 0.0,
-        "detection_latency_max_ms": 0.0,
-        "render_fps": 0.0,
         "rpc_failures": 0,
-        "messages": UIMessages(),
     }
     worker_result: dict[str, Any] = {
         "waypoints": waypoints,
@@ -375,7 +356,6 @@ def main() -> None:
     worker.start()
     capture_worker.start()
 
-    notified: set[str] = set()
     last_saved_render_count = 0
     try:
         while not done_event.is_set():
@@ -389,44 +369,11 @@ def main() -> None:
             if args.debug and snapshot is not None:
                 print(f"[DEBUG] detect frame_id={snapshot.frame_id}")
 
-            # Refresh UI counters (cheap, once per main-loop tick)
-            ui["frames_captured"] = capture_worker.frames_captured
-            ui["capture_fps"] = capture_worker.capture_fps
+            # Refresh only values consumed by the Qt panel.
             ui["detection_fps"] = detector.inference_fps
-            ui["inference_ms"] = detector.last_inference_ms
-            ui["camera_drops"] = capture_worker.frames_dropped
-            ui["detection_drops"] = detector.jobs_dropped
-            ui["capture_rpc_ms"] = capture_worker.last_capture_rpc_ms
-            capture_perf = capture_worker.performance_snapshot()
-            rpc = capture_perf["rpc"]
-            parse = capture_perf["parse"]
-            ui["capture_rpc_avg_ms"] = rpc.average_ms
-            ui["capture_rpc_max_ms"] = rpc.maximum_ms
-            ui["image_parse_avg_ms"] = parse.average_ms
-            ui["image_parse_max_ms"] = parse.maximum_ms
-            detector_perf = detector.performance_snapshot
-            inference = detector_perf["inference"]
-            latency = detector_perf["latency"]
-            ui["detection_avg_ms"] = inference.average_ms
-            ui["detection_max_ms"] = inference.maximum_ms
-            ui["detection_latency_avg_ms"] = latency.average_ms
-            ui["detection_latency_max_ms"] = latency.maximum_ms
             ui["detection_latency_ms"] = detector.last_latency_ms
-            if not args.no_display:
-                ui["render_fps"] = display.render_fps
             if snapshot is not None:
                 ui["detection_latency_ms"] = snapshot.latency_ms or detector.last_latency_ms
-
-            # Surface worker errors in the UI once
-            if capture_worker.error is not None and "camera" not in notified:
-                notified.add("camera")
-                ui["messages"].push("error", f"相机线程错误：{capture_worker.error}")
-            if detector.error is not None and "detector" not in notified:
-                notified.add("detector")
-                ui["messages"].push("error", f"检测线程错误：{detector.error}")
-            if worker_result["error"] is not None and "flight" not in notified:
-                notified.add("flight")
-                ui["messages"].push("error", f"巡航线程错误：{worker_result['error']}")
 
             if raw_frame is not None or snapshot is not None:
                 should_quit = display.show(raw_frame, snapshot, args, ui)

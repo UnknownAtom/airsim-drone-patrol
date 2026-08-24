@@ -5,6 +5,4 @@ torchvision
 opencv-python
 numpy
 pillow
-pandas
-openpyxl
 PyQt6

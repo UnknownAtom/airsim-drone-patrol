@@ -149,7 +149,6 @@ def poll_flight(
     velocity = state.kinematics_estimated.linear_velocity
     x, y, z = float(position.x_val), float(position.y_val), float(position.z_val)
     with state_lock:
-        ui["position"] = (x, y, z)
         ui["altitude"] = z
         ui["speed"] = math.hypot(float(velocity.x_val), float(velocity.y_val))
     return math.sqrt((x - target.x) ** 2 + (y - target.y) ** 2 + (z - target.z) ** 2)
@@ -185,7 +184,6 @@ def _wait_for_state(
             position = state.kinematics_estimated.position
             velocity = state.kinematics_estimated.linear_velocity
             with state_lock:
-                ui["position"] = (float(position.x_val), float(position.y_val), float(position.z_val))
                 ui["altitude"] = float(position.z_val)
                 ui["speed"] = math.hypot(float(velocity.x_val), float(velocity.y_val))
             if predicate(state):
@@ -310,7 +308,6 @@ def fly_to_leg(
         if monitor is not None:
             message = monitor.check()
             if message:
-                ui["messages"].push("warn", message)
                 if args.continue_after_collision:
                     print(f"[FLIGHT] {message}（继续飞行）")
                 else:
@@ -353,7 +350,6 @@ def fly_to_leg(
     time.sleep(0.2)
     if args.debug:
         print(f"[DEBUG] waypoint {waypoint_index} reached; movement task cancelled")
-    ui["messages"].push("info", f"到达航点 {waypoint_index}")
     try:
         client.hoverAsync()
     except Exception as exc:
@@ -427,7 +423,6 @@ def _reconnect_for_flight(
         ui["airsim_connected"] = False
         ui["airsim_ready"] = False
     close_client(old_client)
-    ui["messages"].push("warn", "AirSim 连接中断，正在重新连接…")
     client = _wait_for_connection(args, stop_event, ui, state_lock)
     if client is None:
         return None, False
@@ -452,9 +447,9 @@ def _reconnect_for_flight(
         ui["airsim_error"] = ""
     set_flight_state(ui, state_lock, "CRUISING" if airborne else "READY")
     if airborne:
-        ui["messages"].push("info", "AirSim 已重连，按当前位置恢复当前航点")
+        print("[FLIGHT] AirSim 已重连，按当前位置恢复当前航点")
     else:
-        ui["messages"].push("warn", "AirSim 已重连，但无人机已落地，准备重新起飞")
+        print("[FLIGHT] AirSim 已重连，但无人机已落地，准备重新起飞")
     return client, airborne
 
 
@@ -569,7 +564,6 @@ def _wait_for_connection(
     endpoint = f"{args.airsim_ip}:{args.airsim_port}"
     last_error = ""
     print(f"[FLIGHT] 等待 AirSim 连接…（{endpoint}）")
-    ui["messages"].push("info", "等待 AirSim 信号，请启动模拟器…")
     with state_lock:
         ui["airsim_connected"] = False
         ui["airsim_ready"] = False
@@ -620,7 +614,6 @@ def _wait_for_ready(
     """
     endpoint = f"{args.airsim_ip}:{args.airsim_port}"
     print("[FLIGHT] AirSim 已连接，等待场景就绪…")
-    ui["messages"].push("info", "AirSim 已连接，等待场景加载…")
     last_error = ""
     while not stop_event.is_set():
         try:
@@ -673,7 +666,6 @@ def _takeoff(
     except Exception as exc:
         raise AirSimConnectionLost(f"起飞前 RPC 失败: {exc}") from exc
     print("正在起飞无人机...")
-    ui["messages"].push("info", "正在起飞…")
     if _state_is_landed(state):
         try:
             client.takeoffAsync(timeout_sec=30)
@@ -802,7 +794,6 @@ def flight_worker(
             if not first_run:
                 set_flight_state(ui, state_lock, "READY")
                 print("[FLIGHT] 任务待命：点击“多航点巡航”开始巡航")
-                ui["messages"].push("info", "任务待命：点击“多航点巡航”开始巡航")
                 while not ui["start_cruise"].wait(0.2) and not stop_event.is_set():
                     pass
                 ui["start_cruise"].clear()
@@ -827,7 +818,6 @@ def flight_worker(
             api_control = True
             print(f"巡航高度：{-args.takeoff_z:g} m；最大速度：{args.max_speed:g} m/s")
             print(f"开始巡航：{len(result['waypoints'])} 个航点（“停止任务”按钮或 Q 可停止）")
-            ui["messages"].push("info", f"起飞完成，开始巡航（{len(result['waypoints'])} 个航点）")
 
             patrol_round = 0
             cruise_aborted = False
@@ -842,7 +832,6 @@ def flight_worker(
                         cruise_aborted = True
                         set_flight_state(ui, state_lock, "STOPPING")
                         print("[FLIGHT] 收到停止指令，正在降落…")
-                        ui["messages"].push("info", "收到停止指令，正在降落…")
                         break
                     with state_lock:
                         ui["patrol_round"] = patrol_round
@@ -887,14 +876,12 @@ def flight_worker(
                 set_flight_state(ui, state_lock, "READY")
             if not stop_event.is_set():
                 print("[FLIGHT] 巡航结束，已降落；等待“多航点巡航”重新开始")
-                ui["messages"].push("info", "巡航结束，已降落")
     except Exception as exc:
         result["error"] = exc
         set_flight_state(ui, state_lock, "ERROR")
         with state_lock:
             ui["cruise_started"] = False
         print(f"[FLIGHT] 巡航线程出错，准备降落: {type(exc).__name__}: {exc}")
-        ui["messages"].push("error", f"巡航线程出错：{type(exc).__name__}")
     finally:
         if result["error"] is None and api_control:
             set_flight_state(ui, state_lock, "LANDING")
@@ -926,9 +913,9 @@ def flight_worker(
             ui["airsim_ready"] = False
         close_client(client)
         if landed:
-            ui["messages"].push("info", "任务结束，已降落")
+            print("[FLIGHT] 任务结束，已降落")
         elif api_control:
-            ui["messages"].push("warn", "任务结束，但未确认无人机已落地")
+            print("[FLIGHT] 任务结束，但未确认无人机已落地")
         else:
-            ui["messages"].push("info", "任务已停止")
+            print("[FLIGHT] 任务已停止")
         done_event.set()

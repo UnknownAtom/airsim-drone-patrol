@@ -226,7 +226,6 @@ class CaptureWorker:
                 self.frames_captured += 1
                 self._capture_rate.mark()
                 with self.state_lock:
-                    self.ui["frames_captured"] = self.frames_captured
                     self.ui["camera_ok"] = True
                     self.ui["camera_error"] = ""
 

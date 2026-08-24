@@ -1,18 +1,10 @@
 """PyQt6 前端（自包含）：左侧 PIL 视频区 + 右侧 Qt Widgets 面板。
 
 本模块不再依赖独立的 ``ui.py``（原纯 PIL 前端已移除）：PIL 渲染基础设施
-（配色、字体、消息、预览绘制）直接内联在本模块中，仅保留 Qt 版实际用到
+（配色、字体、预览绘制）直接内联在本模块中，仅保留 Qt 版实际用到
 的部分。
 
-- 左侧视频区：PIL 渲染检测框、HUD、chips，结果转为 ``QPixmap`` 显示在
-  ``QLabel`` 上；
-- 右侧面板：Qt Widgets（状态区、信息卡片、进度条、航点路线、目标区、
-  操作按钮、紧凑状态条）；
-- ``show(packet, snapshot, args, ui) -> bool`` 与 ``process_events()``
-  签名/语义不变：返回 True 表示用户请求退出（Q 键或关闭窗口）。
-
-视觉规范（SCD 风格）：浅灰背景 #F2F2F7、白卡片圆角 12px、深蓝主色
-#324CB4、进度条淡蓝轨道 #EEF1FB、成功绿 / 警告红语义色。
+视觉规范：浅色大圆角扁平风格（纯色无渐变、大胶囊圆角、无文字描线/无聚焦虚框）。
 """
 
 from __future__ import annotations
@@ -20,7 +12,6 @@ from __future__ import annotations
 import time
 from collections import deque
 from pathlib import Path
-from threading import Lock
 from typing import Any
 
 import cv2
@@ -28,10 +19,21 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QColor, QFont, QFontDatabase, QImage, QKeySequence, QPainter, QPen, QPixmap, QShortcut
+from PyQt6.QtGui import (
+    QColor,
+    QFont,
+    QFontDatabase,
+    QImage,
+    QKeySequence,
+    QPainter,
+    QPen,
+    QPixmap,
+    QShortcut,
+)
 from PyQt6.QtWidgets import (
     QApplication,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QMainWindow,
@@ -48,7 +50,7 @@ from performance import RateWindow, RollingStats, StatsSnapshot
 WINDOW_TITLE = "AirSim 无人机目标检测系统"
 
 # ---------------------------------------------------------------------------
-# PIL 渲染基础设施（原 ui.py 内联，仅保留 Qt 版使用部分）
+# PIL 渲染基础设施
 # ---------------------------------------------------------------------------
 
 DISPLAY_NAME_MAP = {
@@ -70,26 +72,23 @@ def _display_name(name: str) -> str:
     return DISPLAY_NAME_MAP.get(str(name).strip().lower(), str(name))
 
 
-# MD3（Material Design 3）蓝色系浅色色板。
-# PIL 视频区（预览面/HUD/检测框）与 Qt 面板共用，键名保持兼容。
+# 浅色大圆角扁平色板（纯色、无渐变）
 COLORS: dict[str, tuple[int, int, int]] = {
-    "bg": (253, 252, 255),            # surface
-    "surface": (255, 255, 255),       # surfaceContainerLowest
-    "preview": (207, 229, 255),       # primaryContainer（视频区淡蓝）
-    "primary": (0, 97, 164),          # primary（M3 Blue）
-    "primary_soft": (207, 229, 255),  # primaryContainer
-    "text": (25, 28, 32),             # onSurface
-    "muted": (68, 71, 78),            # onSurfaceVariant
-    "muted_light": (117, 119, 127),   # outline
-    "border": (196, 199, 207),        # outlineVariant
-    "soft_gray": (241, 244, 250),     # surfaceContainer
-    "soft_blue": (214, 227, 247),     # secondaryContainer
-    "surface_high": (229, 233, 240),  # surfaceContainerHighest（进度轨道）
-    "success": (59, 125, 63),
-    "warning": (186, 26, 26),         # error
-    "warning_soft": (255, 218, 214),  # errorContainer
+    "bg": (244, 245, 247),  # 主背景（浅灰）
+    "surface": (255, 255, 255),  # 卡片背景（纯白）
+    "surface_sub": (238, 240, 244),  # 次级卡片/浅底
+    "preview": (228, 232, 240),  # 视频区未就绪浅底
+    "primary": (37, 99, 235),  # 主色调蓝
+    "primary_soft": (219, 234, 254),  # 软蓝背景
+    "primary_dark": (29, 78, 216),  # Hover 蓝
+    "text": (30, 41, 59),  # 主文字（深灰/接近黑）
+    "muted": (100, 116, 139),  # 次要文字
+    "muted_light": (148, 163, 184),  # 浅灰/占位符
+    "border": (226, 232, 240),  # 卡片外边框色
+    "success": (22, 163, 74),  # 成功绿
+    "warning": (220, 38, 38),  # 警告红
+    "warning_soft": (254, 226, 226),  # 警告浅红
     "white": (255, 255, 255),
-    "image_border": (255, 255, 255),
 }
 
 TYPE = {
@@ -163,24 +162,6 @@ class UIFonts:
         return font.getlength(str(text))
 
 
-class UIMessages:
-    """线程安全的消息队列（飞行/取图线程写入，GUI 读取）。"""
-
-    def __init__(self, maxlen: int = 40, ttl: float = 8.0) -> None:
-        self._items: deque[tuple[float, str, str]] = deque(maxlen=maxlen)
-        self._ttl = ttl
-        self._lock = Lock()
-
-    def push(self, kind: str, text: str) -> None:
-        with self._lock:
-            self._items.append((time.monotonic() + self._ttl, kind, text))
-
-    def snapshot(self, now: float | None = None) -> list[tuple[str, str]]:
-        now = time.monotonic() if now is None else now
-        with self._lock:
-            return [(kind, text) for expires, kind, text in self._items if expires > now]
-
-
 def _rgba(color: tuple[int, int, int], alpha: int = 255) -> tuple[int, int, int, int]:
     return color + (alpha,)
 
@@ -189,16 +170,14 @@ def _rounded(
     draw: ImageDraw.ImageDraw,
     box: tuple[float, float, float, float],
     fill: tuple[int, int, int],
-    radius: int = 20,
-    outline: tuple[int, int, int] | None = None,
-    width: int = 1,
+    radius: int = 24,
 ) -> None:
+    # 彻底去掉外侧 outline 描边
     draw.rounded_rectangle(
         tuple(int(value) for value in box),
         radius=int(radius),
         fill=_rgba(fill),
-        outline=_rgba(outline) if outline else None,
-        width=width,
+        outline=None,
     )
 
 
@@ -232,7 +211,7 @@ def _paste_rounded(
     source: Image.Image,
     xy: tuple[int, int],
     size: tuple[int, int],
-    radius: int,
+    radius: int = 20,
 ) -> None:
     resized = source.resize(size, Image.Resampling.BILINEAR).convert("RGBA")
     mask = Image.new("L", size, 0)
@@ -244,7 +223,7 @@ def _paste_rounded(
 
 
 class _PilRenderer:
-    """PIL 预览渲染器：检测框、HUD、chips（原 ui.py DetectionDisplay 精简版）。"""
+    """PIL 预览渲染器：精简四角检测框、无描边悬浮 HUD 胶囊。"""
 
     def __init__(self) -> None:
         self.scheme = COLORS
@@ -258,12 +237,7 @@ class _PilRenderer:
         self._next_render_at = 0.0
         self._last_event_pump = 0.0
         self._detection_fresh = False
-        # Keep a short history so a DetectionSnapshot can be verified against
-        # a frame that was actually displayed. The live queue intentionally
-        # drops old frames, so a future detection result must never be painted
-        # on an unrelated current frame.
         self._frame_history: deque[Any] = deque(maxlen=8)
-        self._detection_packet: Any = None
 
     def _text(
         self,
@@ -295,31 +269,24 @@ class _PilRenderer:
             _rgba(self.scheme[color]),
         )
 
-    def _draw_target_icon(
+    def _draw_corner_bbox(
         self,
         draw: ImageDraw.ImageDraw,
-        cx: int,
-        cy: int,
+        box: tuple[float, float, float, float],
         color: tuple[int, int, int],
-        scale: float = 1.0,
+        corner_len: int = 12,
+        width: int = 3,
     ) -> None:
-        radius = int(13 * scale)
-        draw.ellipse(
-            (cx - radius, cy - radius, cx + radius, cy + radius),
-            outline=_rgba(color),
-            width=2,
-        )
-        core = int(4 * scale)
-        draw.ellipse(
-            (cx - core, cy - core, cx + core, cy + core),
-            fill=_rgba(color),
-        )
-        gap = int(17 * scale)
-        length = int(7 * scale)
-        draw.line((cx - gap, cy, cx - gap + length, cy), fill=_rgba(color), width=2)
-        draw.line((cx + gap - length, cy, cx + gap, cy), fill=_rgba(color), width=2)
-        draw.line((cx, cy - gap, cx, cy - gap + length), fill=_rgba(color), width=2)
-        draw.line((cx, cy + gap - length, cx, cy + gap), fill=_rgba(color), width=2)
+        x1, y1, x2, y2 = box
+        # 四角锚点线段
+        draw.line([(x1, y1), (x1 + corner_len, y1)], fill=_rgba(color), width=width)
+        draw.line([(x1, y1), (x1, y1 + corner_len)], fill=_rgba(color), width=width)
+        draw.line([(x2, y1), (x2 - corner_len, y1)], fill=_rgba(color), width=width)
+        draw.line([(x2, y1), (x2, y1 + corner_len)], fill=_rgba(color), width=width)
+        draw.line([(x1, y2), (x1 + corner_len, y2)], fill=_rgba(color), width=width)
+        draw.line([(x1, y2), (x1, y2 - corner_len)], fill=_rgba(color), width=width)
+        draw.line([(x2, y2), (x2 - corner_len, y2)], fill=_rgba(color), width=width)
+        draw.line([(x2, y2), (x2, y2 - corner_len)], fill=_rgba(color), width=width)
 
     def _chip(
         self,
@@ -328,20 +295,22 @@ class _PilRenderer:
         y: int,
         text: str,
         *,
-        fill: str = "primary_soft",
-        color: str = "primary",
+        fill: str = "surface",
+        color: str = "text",
         dot: str | None = None,
     ) -> tuple[int, int]:
         size, weight = TYPE["small"]
         dot_width = 12 if dot else 0
         width = int(self.fonts.measure(text, size, weight) + 24 + dot_width)
-        height = 30
-        _rounded(draw, (x, y, x + width, y + height), self.scheme[fill], 15)
+        height = 32
+        _rounded(draw, (x, y, x + width, y + height), self.scheme[fill], radius=16)
         text_x = x + 12
         if dot:
-            draw.ellipse((x + 10, y + 12, x + 16, y + 18), fill=_rgba(self.scheme[dot]))
+            draw.ellipse((x + 10, y + 13, x + 16, y + 19), fill=_rgba(self.scheme[dot]))
             text_x += dot_width
-        self.fonts.draw(draw, (text_x, y + 7), text, size, weight, _rgba(self.scheme[color]))
+        self.fonts.draw(
+            draw, (text_x, y + 8), text, size, weight, _rgba(self.scheme[color])
+        )
         return width, height
 
     def _draw_preview(
@@ -352,23 +321,21 @@ class _PilRenderer:
         ui: dict[str, Any],
     ) -> None:
         x1, y1, x2, y2 = box
-        _rounded(draw, box, self.scheme["preview"], 20)
-        inner = (x1 + 15, y1 + 15, x2 - 15, y2 - 15)
-        _rounded(draw, inner, self.scheme["preview"], 14)
+        _rounded(draw, box, self.scheme["surface"], radius=28)
+        inner = (x1 + 12, y1 + 12, x2 - 12, y2 - 12)
+        _rounded(draw, inner, self.scheme["preview"], radius=20)
         image_box = (inner[0] + 1, inner[1] + 1, inner[2] - 1, inner[3] - 1)
 
         if self.last_packet is None:
-            self._draw_target_icon(
-                draw,
-                (inner[0] + inner[2]) // 2,
-                (inner[1] + inner[3]) // 2 - 15,
-                self.scheme["primary"],
-                1.2,
-            )
             self._center_text(
                 draw,
-                (inner[0], inner[1] + (inner[3] - inner[1]) // 2 + 28, inner[2], inner[3]),
-                "系统准备就绪，等待相机画面…",
+                (
+                    inner[0],
+                    inner[1] + (inner[3] - inner[1]) // 2 - 10,
+                    inner[2],
+                    inner[3],
+                ),
+                "系统就绪 · 等待相机画面",
                 "body",
                 "muted",
             )
@@ -383,25 +350,38 @@ class _PilRenderer:
             image,
             (int(px), int(py)),
             (max(1, int(pw)), max(1, int(ph))),
-            12,
+            radius=18,
         )
 
-        hud_text = f"实时画面  ·  前视相机  ·  {source_w}×{source_h}"
-        hud_w = int(self.fonts.measure(hud_text, *TYPE["small"]) + 32)
+        # 顶部悬浮 HUD（无边框纯白胶囊）
+        hud_text = f"前视监控  ·  {source_w}×{source_h}"
+        hud_w = int(self.fonts.measure(hud_text, *TYPE["small"]) + 36)
         _rounded(
             draw,
-            (inner[0] + 12, inner[1] + 12, inner[0] + 12 + hud_w, inner[1] + 42),
-            self.scheme["preview"],
-            15,
+            (inner[0] + 16, inner[1] + 16, inner[0] + 16 + hud_w, inner[1] + 48),
+            self.scheme["surface"],
+            radius=16,
         )
         draw.ellipse(
-            (inner[0] + 22, inner[1] + 24, inner[0] + 28, inner[1] + 30),
-            fill=_rgba(self.scheme["primary"]),
+            (inner[0] + 26, inner[1] + 29, inner[0] + 32, inner[1] + 35),
+            fill=_rgba(self.scheme["success"]),
         )
-        self._text(draw, (inner[0] + 37, inner[1] + 19), hud_text, "small", "primary")
+        self._text(draw, (inner[0] + 40, inner[1] + 23), hud_text, "small", "text")
 
-        if self.last_snapshot is not None and self._detection_fresh and ui.get("show_detections", True):
-            for xmin, ymin, xmax, ymax, _class_id, confidence, name in self.last_snapshot.boxes:
+        if (
+            self.last_snapshot is not None
+            and self._detection_fresh
+            and ui.get("show_detections", True)
+        ):
+            for (
+                xmin,
+                ymin,
+                xmax,
+                ymax,
+                _class_id,
+                confidence,
+                name,
+            ) in self.last_snapshot.boxes:
                 accent = "primary" if confidence >= 0.45 else "warning"
                 left = _clip(px + xmin * scale, image_box[0], image_box[2])
                 top = _clip(py + ymin * scale, image_box[1], image_box[3])
@@ -409,24 +389,38 @@ class _PilRenderer:
                 bottom = _clip(py + ymax * scale, image_box[1], image_box[3])
                 if right <= left or bottom <= top:
                     continue
-                draw.rounded_rectangle(
+
+                self._draw_corner_bbox(
+                    draw,
                     (left, top, right, bottom),
-                    radius=4,
-                    outline=_rgba(self.scheme[accent]),
+                    self.scheme[accent],
+                    corner_len=14,
                     width=3,
                 )
-                label = f"{_display_name(name)}  {confidence:.0%}"
+
+                label = f"{_display_name(name)} {confidence:.0%}"
                 label_w = int(self.fonts.measure(label, *TYPE["small"]) + 18)
-                label_h = 25
-                label_y = top - label_h - 4 if top - label_h - 4 >= image_box[1] else bottom + 4
+                label_h = 24
+                label_y = (
+                    top - label_h - 4
+                    if top - label_h - 4 >= image_box[1]
+                    else bottom + 4
+                )
                 label_y = _clip(label_y, image_box[1], image_box[3] - label_h)
+
+                # 悬浮文字标签（无描边纯白底）
                 _rounded(
                     draw,
-                    (left, label_y, min(image_box[2], left + label_w), label_y + label_h),
+                    (
+                        left,
+                        label_y,
+                        min(image_box[2], left + label_w),
+                        label_y + label_h,
+                    ),
                     self.scheme["surface"],
-                    8,
+                    radius=12,
                 )
-                self._text(draw, (left + 9, label_y + 6), label, "small", accent)
+                self._text(draw, (left + 9, label_y + 5), label, "small", accent)
 
         frame_id = self.last_packet.frame_id
         detection_count = (
@@ -434,8 +428,22 @@ class _PilRenderer:
             if self.last_snapshot is not None and self._detection_fresh
             else 0
         )
-        self._chip(draw, inner[0] + 12, inner[3] - 42, f"帧 {frame_id:06d}", fill="preview", color="primary")
-        self._chip(draw, inner[0] + 128, inner[3] - 42, f"目标 {detection_count}", fill="preview", color="primary")
+        self._chip(
+            draw,
+            inner[0] + 16,
+            inner[3] - 48,
+            f"帧 {frame_id:06d}",
+            fill="surface",
+            color="text",
+        )
+        self._chip(
+            draw,
+            inner[0] + 130,
+            inner[3] - 48,
+            f"目标 {detection_count}",
+            fill="surface",
+            color="primary",
+        )
 
     def _status_values(self, ui: dict[str, Any]) -> tuple[str, str, str]:
         camera_ok = bool(ui.get("camera_ok"))
@@ -443,49 +451,48 @@ class _PilRenderer:
         flight_state = str(ui.get("flight_state", ""))
         if flight_state == "ERROR":
             error = str(ui.get("airsim_error", "")).strip()
-            return "● 任务异常", "warning", error or "飞行线程出现异常，请检查终端日志"
+            return "任务异常", "warning", error or "飞行线程异常，请检查终端日志"
         if not ui.get("airsim_connected", False):
             error = str(ui.get("airsim_error", "")).strip()
-            subtitle = "未检测到 AirSim 模拟器，请先启动场景"
+            subtitle = "未连接模拟器，请启动 AirSim 场景"
             if error:
                 subtitle = f"连接失败：{error}"
             return "等待 AirSim 信号", "muted", subtitle
         if not ui.get("airsim_ready", False):
-            return "等待场景就绪", "muted", "AirSim 已连接，场景加载中…"
+            return "加载场景", "muted", "AirSim 已连接，加载中…"
         if flight_state == "TAKING_OFF":
-            return "● 正在起飞", "primary", "正在爬升至巡航高度"
+            return "正在起飞", "primary", "正在爬升至巡航高度"
         if flight_state == "STOPPING":
-            return "● 正在停止", "warning", "正在取消航段并准备降落"
+            return "正在停止", "warning", "取消航段中，准备降落"
         if flight_state == "LANDING":
-            return "● 正在降落", "primary", "正在执行安全降落"
+            return "正在降落", "primary", "执行安全降落"
         if not ui.get("cruise_started", False):
-            return "● 任务待命", "primary", "点击“多航点巡航”开始任务"
+            return "系统待命", "primary", "点击下方“多航点巡航”开始"
         if not camera_ok:
             camera_error = str(ui.get("camera_error", "")).strip()
-            return "待命", "muted", f"相机连接失败：{camera_error}" if camera_error else "等待相机连接"
-        if self._detection_fresh and self.last_snapshot is not None and self.last_snapshot.boxes:
-            return "● 发现目标", "warning", "正在进行目标检测"
+            return (
+                "待命",
+                "muted",
+                f"相机连接失败：{camera_error}" if camera_error else "等待相机",
+            )
+        if (
+            self._detection_fresh
+            and self.last_snapshot is not None
+            and self.last_snapshot.boxes
+        ):
+            return "发现目标", "warning", "实时目标视觉识别中"
         if waypoint > 0:
-            return "● 自动巡航", "primary", "实时视觉检测中"
-        return "● 监测中", "success", "相机已连接"
+            return "自动巡航", "primary", "多航点路线巡航中"
+        return "监测中", "success", "设备运行正常"
 
 
 # ---------------------------------------------------------------------------
-# 颜色与字体辅助（Qt 侧）
+# Qt 辅助与组件
 # ---------------------------------------------------------------------------
 
 
 def _hex(name: str) -> str:
     r, g, b = COLORS[name]
-    return f"#{r:02X}{g:02X}{b:02X}"
-
-
-def _mix_white(name: str, alpha: float) -> str:
-    """MD3 状态层：在底色上叠加半透明白（hover 8% / pressed 12%）。"""
-    r, g, b = COLORS[name]
-    r = int(r + (255 - r) * alpha)
-    g = int(g + (255 - g) * alpha)
-    b = int(b + (255 - b) * alpha)
     return f"#{r:02X}{g:02X}{b:02X}"
 
 
@@ -501,7 +508,6 @@ _font_names_cache: tuple[str, str] | None = None
 
 
 def _font_names() -> tuple[str, str]:
-    """懒加载字体名：QFontDatabase 需要 QApplication 已存在。"""
     global _font_names_cache
     if _font_names_cache is None:
         _font_names_cache = (
@@ -519,19 +525,14 @@ def _make_font(size: int, weight: int = 400, latin: bool = False) -> QFont:
     return font
 
 
-# ---------------------------------------------------------------------------
-# Qt 自定义控件
-# ---------------------------------------------------------------------------
-
-
 class RouteWidget(QWidget):
-    """航点路线图：水平线 + 圆点标记，当前航点高亮。"""
+    """航点路线图。"""
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._total = 1
         self._index = 0
-        self.setMinimumHeight(56)
+        self.setMinimumHeight(44)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
     def set_progress(self, total: int, index: int) -> None:
@@ -541,14 +542,14 @@ class RouteWidget(QWidget):
             self._total, self._index = total, index
             self.update()
 
-    def paintEvent(self, _event) -> None:  # noqa: N802 (Qt 命名)
+    def paintEvent(self, _event) -> None:  # noqa: N802
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         width, height = self.width(), self.height()
         line_y = height // 2
-        left, right = 14, width - 14
+        left, right = 16, width - 16
 
-        painter.setPen(QPen(QColor(_hex("border")), 3))
+        painter.setPen(QPen(QColor(_hex("surface_sub")), 4))
         painter.drawLine(left, line_y, right, line_y)
 
         step = (right - left) / max(1, self._total - 1)
@@ -556,84 +557,77 @@ class RouteWidget(QWidget):
             px = left + step * point_index
             active = point_index < self._index
             current = point_index == max(0, self._index - 1)
+
             if current:
-                painter.setPen(QPen(QColor(_hex("primary")), 2))
-                painter.setBrush(Qt.BrushStyle.NoBrush)
-                painter.drawEllipse(int(px) - 11, line_y - 11, 22, 22)
-            painter.setPen(QPen(QColor(_hex("primary")), 2))
-            painter.setBrush(QColor(_hex("primary")) if active or current else QColor(_hex("surface")))
-            radius = 7 if current else 5
-            painter.drawEllipse(int(px) - radius, line_y - radius, radius * 2, radius * 2)
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QColor(_hex("primary_soft")))
+                painter.drawEllipse(int(px) - 10, line_y - 10, 20, 20)
+
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(
+                QColor(_hex("primary"))
+                if active or current
+                else QColor(_hex("muted_light"))
+            )
+            radius = 6 if current else 4
+            painter.drawEllipse(
+                int(px) - radius, line_y - radius, radius * 2, radius * 2
+            )
 
 
-class StatusStrip(QWidget):
-    """紧凑模式底部状态条：相机 / 航点 / 高度 / 速度 / 目标 五栏。"""
+class MetricTile(QFrame):
+    """大圆角无描线数据小卡片。"""
 
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(
+        self, title: str, unit: str = "", parent: QWidget | None = None
+    ) -> None:
         super().__init__(parent)
-        self.setObjectName("statusStrip")
         self.setStyleSheet(
-            f"#statusStrip {{ background: {_hex('surface')}; border-radius: 16px; }}"
+            f"MetricTile {{ background: {_hex('surface_sub')}; border-radius: 18px; border: none; }}"
         )
-        self._labels: dict[str, QLabel] = {}
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(18, 10, 18, 10)
-        layout.setSpacing(24)
-        for key, title in (
-            ("camera", "相机"),
-            ("waypoint", "航点"),
-            ("altitude", "高度"),
-            ("speed", "速度"),
-            ("target", "目标"),
-        ):
-            column = QVBoxLayout()
-            column.setSpacing(2)
-            caption = QLabel(title)
-            caption.setFont(_make_font(12))
-            caption.setStyleSheet(f"color: {_hex('muted')};")
-            value = QLabel("—")
-            value.setFont(_make_font(18, 700, latin=True))
-            value.setStyleSheet(f"color: {_hex('text')};")
-            column.addWidget(caption)
-            column.addWidget(value)
-            layout.addLayout(column)
-            self._labels[key] = value
-        layout.addStretch(1)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 10, 14, 10)
+        layout.setSpacing(2)
 
-    def set_values(self, ui: dict[str, Any]) -> None:
-        index = int(ui.get("waypoint_index", 0))
-        total = max(1, int(ui.get("waypoints_total", 1)))
-        self._labels["camera"].setText("在线" if ui.get("camera_ok") else "等待")
-        self._labels["waypoint"].setText(f"{min(index, total)}/{total}")
-        self._labels["altitude"].setText(f"{-float(ui.get('altitude', 0.0)):.1f}")
-        self._labels["speed"].setText(f"{float(ui.get('speed', 0.0)):.2f}")
-        self._labels["target"].setText(str(ui.get("detections", 0)))
+        self.label_title = QLabel(title)
+        self.label_title.setFont(_make_font(12))
+        self.label_title.setStyleSheet(f"color: {_hex('muted')}; border: none;")
+
+        self.label_val = QLabel("—")
+        self.label_val.setFont(_make_font(20, 700, latin=True))
+        self.label_val.setStyleSheet(f"color: {_hex('text')}; border: none;")
+
+        self._unit = unit
+
+        layout.addWidget(self.label_title)
+        layout.addWidget(self.label_val)
+
+    def set_value(self, val_str: str) -> None:
+        if self._unit:
+            self.label_val.setText(f"{val_str} {self._unit}")
+        else:
+            self.label_val.setText(val_str)
 
 
 class _MainWindow(QMainWindow):
-    """带关闭通知的主窗口。"""
-
     closed = pyqtSignal()
 
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle(WINDOW_TITLE)
 
-    def closeEvent(self, event) -> None:  # noqa: N802 (Qt 命名)
+    def closeEvent(self, event) -> None:  # noqa: N802
         self.closed.emit()
         super().closeEvent(event)
 
 
 # ---------------------------------------------------------------------------
-# Qt 版 DetectionDisplay
+# 主 UI 控制台
 # ---------------------------------------------------------------------------
 
 
 class DetectionDisplay(_PilRenderer):
-    """SCD 风格 Qt 控制台：左侧 PIL 视频区 + 右侧 Qt Widgets 面板。"""
-
-    COMPACT_MIN_WIDTH = 1120
-    COMPACT_MIN_HEIGHT = 720
+    """极简浅色大圆角 UI 控制台。"""
 
     def __init__(self, theme: str = "light") -> None:
         super().__init__()
@@ -642,9 +636,6 @@ class DetectionDisplay(_PilRenderer):
         self._window_shown = False
         self._build_window()
 
-    # ------------------------------------------------------------------
-    # 窗口构建
-    # ------------------------------------------------------------------
     def _build_window(self) -> None:
         self._window = _MainWindow()
         self._window.closed.connect(self._request_quit)
@@ -654,24 +645,21 @@ class DetectionDisplay(_PilRenderer):
         root = QWidget()
         self._window.setCentralWidget(root)
         root_layout = QHBoxLayout(root)
-        root_layout.setContentsMargins(16, 16, 16, 16)
-        root_layout.setSpacing(16)
+        root_layout.setContentsMargins(20, 20, 20, 20)
+        root_layout.setSpacing(20)
 
         # ---- 左侧视频区 ----
         self.video_label = QLabel()
         self.video_label.setMinimumSize(320, 240)
         self.video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.video_label.setStyleSheet(f"background: {_hex('preview')}; border-radius: 20px;")
+        self.video_label.setStyleSheet(
+            f"background: {_hex('surface')}; border-radius: 28px; border: 1px solid {_hex('border')};"
+        )
         root_layout.addWidget(self.video_label, stretch=7)
 
         # ---- 右侧面板 ----
         self._build_panel()
         root_layout.addWidget(self.right_panel, stretch=3)
-
-        # ---- 紧凑状态条 ----
-        self.status_strip = StatusStrip()
-        root_layout.addWidget(self.status_strip)
-        self.status_strip.hide()
 
     def _build_panel(self) -> None:
         self.right_panel = QWidget()
@@ -679,148 +667,181 @@ class DetectionDisplay(_PilRenderer):
         panel.setContentsMargins(0, 0, 0, 0)
         panel.setSpacing(16)
 
-        # ---- 状态卡 ----
-        self.status_card = self._make_md3_card(fill="surface")
+        # 1. 顶部 Hero 核心状态卡片
+        self.status_card = self._make_card(radius=24)
         status_layout = self.status_card.layout()
-        self.status_title = QLabel("● 监测中")
-        self.status_title.setFont(_make_font(24, 700))
-        self.status_title.setStyleSheet(f"color: {_hex('success')};")
-        self.status_subtitle = QLabel("相机已连接")
+
+        top_row = QHBoxLayout()
+        self.status_dot = QLabel("●")
+        self.status_dot.setFont(_make_font(18))
+        self.status_dot.setStyleSheet(f"color: {_hex('success')}; border: none;")
+
+        self.status_title = QLabel("监测中")
+        self.status_title.setFont(_make_font(20, 700))
+        self.status_title.setStyleSheet(f"color: {_hex('text')}; border: none;")
+
+        top_row.addWidget(self.status_dot)
+        top_row.addWidget(self.status_title)
+        top_row.addStretch(1)
+
+        self.status_subtitle = QLabel("相机设备连接正常")
         self.status_subtitle.setFont(_make_font(13))
-        self.status_subtitle.setStyleSheet(f"color: {_hex('muted')};")
+        self.status_subtitle.setStyleSheet(f"color: {_hex('muted')}; border: none;")
         self.status_subtitle.setWordWrap(True)
-        self.status_subtitle.setMaximumHeight(42)
-        status_layout.addWidget(self.status_title)
+
+        status_layout.addLayout(top_row)
         status_layout.addWidget(self.status_subtitle)
         panel.addWidget(self.status_card)
 
-        # ---- 飞行数据卡 ----
-        self.data_card = self._make_md3_card()
-        data_layout = self.data_card.layout()
-        self.card_camera = self._make_info_row()
-        self.card_waypoint = self._make_info_row()
-        self.card_flight = self._make_info_row()
-        self.card_performance = self._make_info_row()
-        self.card_performance.setFont(_make_font(13))
-        self.card_performance.setStyleSheet(f"color: {_hex('muted')};")
-        self.card_drops = self._make_info_row()
-        self.card_drops.setFont(_make_font(13))
-        self.card_drops.setStyleSheet(f"color: {_hex('muted')};")
-        data_layout.addWidget(self.card_camera)
-        data_layout.addWidget(self.card_waypoint)
-        data_layout.addWidget(self.card_flight)
-        data_layout.addWidget(self.card_performance)
-        data_layout.addWidget(self.card_drops)
-        panel.addWidget(self.data_card)
+        # 2. 核心指标 2x2 网格小卡片
+        grid_widget = QWidget()
+        grid = QGridLayout(grid_widget)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(10)
 
-        # ---- 巡航进度卡 ----
-        self.progress_card = self._make_md3_card()
+        self.tile_alt = MetricTile("飞行高度", "m")
+        self.tile_spd = MetricTile("飞行速度", "m/s")
+        self.tile_fps = MetricTile("推理帧率", "fps")
+        self.tile_lat = MetricTile("系统延迟", "ms")
+
+        grid.addWidget(self.tile_alt, 0, 0)
+        grid.addWidget(self.tile_spd, 0, 1)
+        grid.addWidget(self.tile_fps, 1, 0)
+        grid.addWidget(self.tile_lat, 1, 1)
+        panel.addWidget(grid_widget)
+
+        # 3. 巡航进度卡片
+        self.progress_card = self._make_card(radius=24)
         progress_layout = self.progress_card.layout()
-        progress_row = QHBoxLayout()
-        progress_row.setSpacing(10)
-        progress_caption = QLabel("巡航进度")
-        progress_caption.setFont(_make_font(13))
-        progress_caption.setStyleSheet(f"color: {_hex('muted')};")
-        self.round_label = QLabel("0 / 1 · 第 0 圈")
-        self.round_label.setFont(_make_font(13))
-        self.round_label.setStyleSheet(f"color: {_hex('muted')};")
+
+        prog_header = QHBoxLayout()
+        prog_title = QLabel("巡航进度")
+        prog_title.setFont(_make_font(13, 700))
+        prog_title.setStyleSheet(f"color: {_hex('text')}; border: none;")
+
+        self.round_label = QLabel("0 / 0 航点")
+        self.round_label.setFont(_make_font(12, latin=True))
+        self.round_label.setStyleSheet(f"color: {_hex('muted')}; border: none;")
+
+        prog_header.addWidget(prog_title)
+        prog_header.addStretch(1)
+        prog_header.addWidget(self.round_label)
+        progress_layout.addLayout(prog_header)
+
         self.progress = QProgressBar()
         self.progress.setRange(0, 1)
         self.progress.setValue(0)
         self.progress.setTextVisible(False)
-        self.progress.setFixedHeight(4)
+        self.progress.setFixedHeight(8)
         self.progress.setStyleSheet(
-            f"QProgressBar {{ background: {_hex('surface_high')}; border: none;"
-            f" border-radius: 2px; }}"
-            f"QProgressBar::chunk {{ background: {_hex('primary')}; border-radius: 2px; }}"
+            f"QProgressBar {{ background: {_hex('surface_sub')}; border: none; border-radius: 4px; }}"
+            f"QProgressBar::chunk {{ background: {_hex('primary')}; border-radius: 4px; }}"
         )
-        progress_row.addWidget(progress_caption)
-        progress_row.addWidget(self.progress, stretch=1)
-        progress_row.addWidget(self.round_label)
-        progress_layout.addLayout(progress_row)
+        progress_layout.addWidget(self.progress)
+
         self.route_widget = RouteWidget()
         progress_layout.addWidget(self.route_widget)
         panel.addWidget(self.progress_card)
 
-        # ---- 目标卡（全部检测目标；固定高度 + 滚动，避免目标过多拉长面板）----
-        self.target_card = self._make_md3_card()
+        # 4. 检测目标展示卡
+        self.target_card = self._make_card(radius=24)
         target_layout = self.target_card.layout()
+
         target_title = QLabel("检测目标")
-        target_title.setFont(_make_font(13))
-        target_title.setStyleSheet(f"color: {_hex('muted')};")
+        target_title.setFont(_make_font(13, 700))
+        target_title.setStyleSheet(f"color: {_hex('text')}; border: none;")
         target_layout.addWidget(target_title)
+
         self.target_scroll = QScrollArea()
         self.target_scroll.setWidgetResizable(True)
-        self.target_scroll.setFixedHeight(140)
+        self.target_scroll.setFixedHeight(95)
         self.target_scroll.setFrameShape(QFrame.Shape.NoFrame)
         self.target_scroll.setStyleSheet(
             "QScrollArea { background: transparent; border: none; }"
-            "QScrollBar:vertical { background: transparent; width: 6px; margin: 0; }"
-            f"QScrollBar::handle:vertical {{ background: {_hex('border')};"
-            " border-radius: 3px; min-height: 20px; }"
+            "QScrollBar:vertical { background: transparent; width: 4px; margin: 0; }"
+            f"QScrollBar::handle:vertical {{ background: {_hex('border')}; border-radius: 2px; }}"
             "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }"
         )
-        self.target_label = QLabel("当前画面没有检测目标")
-        self.target_label.setFont(_make_font(15))
+
+        self.target_label = QLabel("当前画面无检测目标")
+        self.target_label.setFont(_make_font(13))
         self.target_label.setWordWrap(True)
-        self.target_label.setStyleSheet(f"color: {_hex('muted_light')};")
+        self.target_label.setStyleSheet(f"color: {_hex('muted_light')}; border: none;")
         self.target_scroll.setWidget(self.target_label)
         target_layout.addWidget(self.target_scroll)
         panel.addWidget(self.target_card)
 
         panel.addStretch(1)
 
-        # ---- 操作卡（按钮绑定真实控制：巡航启停 / 检测框显示开关）----
-        self.action_card = self._make_md3_card(fill="surface")
+        # 5. 操作按钮卡片
+        self.action_card = self._make_card(radius=24)
         action_layout = self.action_card.layout()
-        self.btn_cruise = self._make_button("多航点巡航")
-        self.btn_detect = self._make_button("实时视觉检测")
+
+        self.btn_cruise = self._make_button("多航点巡航", primary=True)
+        self.btn_detect = self._make_button("实时视觉检测", primary=False)
         self.btn_stop = self._make_button("停止任务", danger=True)
+
         self.btn_cruise.clicked.connect(self._on_cruise_clicked)
         self.btn_detect.clicked.connect(self._on_detect_clicked)
         self.btn_stop.clicked.connect(self._on_stop_clicked)
+
         action_layout.addWidget(self.btn_cruise)
         action_layout.addWidget(self.btn_detect)
         action_layout.addWidget(self.btn_stop)
         panel.addWidget(self.action_card)
+
         self._cruise_ui = None
 
-    def _make_md3_card(self, fill: str = "soft_gray") -> QFrame:
-        """MD3 FilledCard：圆角 20px + 布局内边距（QSS padding 对 QFrame 无效）。"""
+    def _make_card(self, radius: int = 24) -> QFrame:
+        """带纤细边框的大圆角卡片。"""
         card = QFrame()
         card.setStyleSheet(
-            f"QFrame {{ background: {_hex(fill)}; border: none; border-radius: 20px; }}"
+            f"QFrame {{ background: {_hex('surface')}; border: 1px solid {_hex('border')}; border-radius: {radius}px; }}"
         )
         layout = QVBoxLayout(card)
-        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setContentsMargins(18, 16, 18, 16)
         layout.setSpacing(10)
         return card
 
-    def _make_info_row(self, text: str = "—") -> QLabel:
-        label = QLabel(text)
-        label.setFont(_make_font(15))
-        label.setStyleSheet(f"color: {_hex('text')};")
-        return label
-
-    def _make_button(self, text: str, danger: bool = False) -> QPushButton:
+    def _make_button(
+        self, text: str, primary: bool = False, danger: bool = False
+    ) -> QPushButton:
+        """胶囊按钮（彻底移除聚焦虚线框 outline / focus border）。"""
         button = QPushButton(text)
         button.setCursor(Qt.CursorShape.PointingHandCursor)
-        button.setFixedHeight(48)
-        base = _hex("warning") if danger else _hex("primary")
-        hover = _mix_white("warning", 0.08) if danger else _mix_white("primary", 0.08)
-        pressed = _mix_white("warning", 0.12) if danger else _mix_white("primary", 0.12)
+        button.setFixedHeight(52)
+
+        if danger:
+            bg = _hex("warning_soft")
+            text_color = _hex("warning")
+            hover_bg = _hex("warning")
+            hover_text = _hex("white")
+        elif primary:
+            bg = _hex("primary")
+            text_color = _hex("white")
+            hover_bg = _hex("primary_dark")
+            hover_text = _hex("white")
+        else:
+            bg = _hex("surface_sub")
+            text_color = _hex("text")
+            hover_bg = _hex("border")
+            hover_text = _hex("text")
+
         button.setStyleSheet(
-            f"QPushButton {{ background: {base}; color: white;"
-            f" border: none; border-radius: 24px; font-size: 15px; font-weight: 700; }}"
-            f"QPushButton:hover {{ background: {hover}; }}"
-            f"QPushButton:pressed {{ background: {pressed}; }}"
+            f"QPushButton {{ background: {bg}; color: {text_color}; border: none; outline: none; border-radius: 26px;"
+            f" font-size: 15px; font-weight: 700; }}"
+            f"QPushButton:focus {{ outline: none; border: none; }}"
+            f"QPushButton:hover {{ background: {hover_bg}; color: {hover_text}; }}"
         )
         return button
 
     def _qss(self) -> str:
+        # 全局消除聚焦蓝/黑边虚线框
         return (
-            f"QMainWindow, QWidget {{ background: {_hex('bg')}; }}"
-            f"QLabel {{ background: transparent; }}"
+            f"QMainWindow, QWidget {{ background: {_hex('bg')}; outline: none; }}"
+            f"QLabel {{ background: transparent; border: none; outline: none; }}"
+            f"*:focus {{ outline: none; border: none; }}"
         )
 
     # ------------------------------------------------------------------
@@ -829,80 +850,80 @@ class DetectionDisplay(_PilRenderer):
     def _request_quit(self) -> None:
         self._quit_requested = True
 
-    def _push_message(self, ui: dict[str, Any], text: str) -> None:
+    def _push_message(self, text: str) -> None:
         print(f"[UI] {text}")
-        messages = ui.get("messages")
-        if messages is not None:
-            messages.push("info", text)
 
     def _on_cruise_clicked(self) -> None:
-        """“多航点巡航”：触发巡航开始（停止后可重新开始）。"""
         ui = self._cruise_ui
         if ui is None:
             return
-        if str(ui.get("flight_state", "")) in {"TAKING_OFF", "CRUISING", "STOPPING", "LANDING"}:
-            self._push_message(ui, "任务正在执行")
-            return
-        if ui.get("cruise_started", False):
-            self._push_message(ui, "巡航进行中")
-            return
-        if not ui.get("airsim_connected", False):
-            self._push_message(ui, "正在等待 AirSim 信号，请启动模拟器")
-            return
-        ui["start_cruise"].set()
-        ui["stop_cruise"].clear()
-        if ui.get("airsim_ready", False):
-            self._push_message(ui, "已发送开始指令，即将起飞")
-        else:
-            self._push_message(ui, "场景加载完成后自动开始巡航")
-
-    def _on_stop_clicked(self) -> None:
-        """“停止任务”：停止巡航并降落（程序保持运行）。"""
-        ui = self._cruise_ui
-        if ui is None:
-            return
-        if not ui.get("cruise_started", False) and str(ui.get("flight_state", "")) not in {
+        if str(ui.get("flight_state", "")) in {
             "TAKING_OFF",
             "CRUISING",
             "STOPPING",
             "LANDING",
         }:
-            self._push_message(ui, "任务未在运行")
+            self._push_message("任务正在执行中")
+            return
+        if ui.get("cruise_started", False):
+            self._push_message("巡航运行中")
+            return
+        if not ui.get("airsim_connected", False):
+            self._push_message("等待 AirSim 连接中")
+            return
+        ui["start_cruise"].set()
+        ui["stop_cruise"].clear()
+        if ui.get("airsim_ready", False):
+            self._push_message("发送巡航指令，即将起飞")
+        else:
+            self._push_message("场景就绪后自动起飞")
+
+    def _on_stop_clicked(self) -> None:
+        ui = self._cruise_ui
+        if ui is None:
+            return
+        if not ui.get("cruise_started", False) and str(
+            ui.get("flight_state", "")
+        ) not in {
+            "TAKING_OFF",
+            "CRUISING",
+            "STOPPING",
+            "LANDING",
+        }:
+            self._push_message("任务未在运行")
             return
         ui["stop_cruise"].set()
-        self._push_message(ui, "正在停止巡航并降落…")
+        self._push_message("停止巡航并准备降落…")
 
     def _on_detect_clicked(self) -> None:
-        """“实时视觉检测”：切换检测框显示。"""
         ui = self._cruise_ui
         if ui is None:
             return
         show = not ui.get("show_detections", True)
         ui["show_detections"] = show
-        self._push_message(ui, f"检测框显示已{'开启' if show else '关闭'}")
+        self._push_message(f"检测框显示已{'开启' if show else '关闭'}")
 
     # ------------------------------------------------------------------
-    # 对外接口（与旧 ui.py 语义一致）
+    # 渲染与更新
     # ------------------------------------------------------------------
     def show(self, packet: Any, snapshot: Any, args: Any, ui: dict[str, Any]) -> bool:
         if args.no_display:
             return False
         self._cruise_ui = ui
-        has_update = packet is not None or snapshot is not None or not self._window_shown
+        has_update = (
+            packet is not None or snapshot is not None or not self._window_shown
+        )
         if packet is not None:
             self.last_packet = packet
             self._frame_history.append(packet)
         if snapshot is not None:
             self.last_snapshot = snapshot
-        # 帧号同步：检测结果必须来自已经进入显示历史的帧；未来帧、
-        # 过期帧和无法找到原图的结果都不再绘制，避免检测框错位。
-        self._detection_packet = None
+
         if self.last_packet is None or self.last_snapshot is None:
             self._detection_fresh = False
         else:
-            current_id = int(self.last_packet.frame_id)
             detection_id = int(self.last_snapshot.frame_id)
-            self._detection_packet = next(
+            detection_packet = next(
                 (
                     history_packet
                     for history_packet in reversed(self._frame_history)
@@ -910,22 +931,25 @@ class DetectionDisplay(_PilRenderer):
                 ),
                 None,
             )
-            self._detection_fresh = (
-                self._detection_packet is not None
-                and 0 <= current_id - detection_id <= 2
-            )
+            # 方案 C：以“检测帧已进入显示历史”为唯一判据。
+            # _frame_history 只保留最近到达的 8 帧（约 320-580ms），本身就是时间窗：
+            # 未来帧不可能出现在 history 中；过期结果会随 history 滚动而滑出窗口。
+            # 原来硬编码的 2 帧上限（≈80ms）在推理较慢（CPU/大 imgsz）时会让
+            # 检测框和目标列表永远不显示，这里放宽为 history 覆盖的时间范围。
+            self._detection_fresh = detection_packet is not None
         now = time.monotonic()
         if not has_update or (self._window_shown and now < self._next_render_at):
             return self.process_events()
         if not self._window_shown:
-            self._window.resize(max(960, int(args.display_width)), max(600, int(args.display_height)))
+            self._window.resize(
+                max(960, int(args.display_width)), max(600, int(args.display_height))
+            )
             self._window.show()
             self._window_shown = True
 
         render_started = time.perf_counter()
         self._render_video(ui, save_render=int(getattr(args, "save_ui_every", 0)) > 0)
         self._update_panel(ui)
-        self._update_compact()
         render_ms = (time.perf_counter() - render_started) * 1000.0
         self.render_stats.add(render_ms)
         self._render_rate.mark()
@@ -937,18 +961,12 @@ class DetectionDisplay(_PilRenderer):
 
     def process_events(self, force: bool = False) -> bool:
         now = time.monotonic()
-        # Qt event pumping is useful at about 30 Hz; calling it every 5–10 ms
-        # only adds main-thread work when no new frame is available.
         if force or now - self._last_event_pump >= 1.0 / 30.0:
             QApplication.processEvents()
             self._last_event_pump = now
         return self._quit_requested
 
-    # ------------------------------------------------------------------
-    # 渲染
-    # ------------------------------------------------------------------
     def _render_video(self, ui: dict[str, Any], *, save_render: bool = False) -> None:
-        """左侧：PIL 渲染（检测框/HUD）到内存图像 -> QPixmap -> QLabel。"""
         size = self.video_label.size()
         width = max(320, size.width())
         height = max(240, size.height())
@@ -957,10 +975,14 @@ class DetectionDisplay(_PilRenderer):
         self._draw_preview(canvas, draw, (0, 0, width, height), ui)
 
         rgb = np.asarray(canvas.convert("RGB"))
-        qimage = QImage(rgb.data, rgb.shape[1], rgb.shape[0], rgb.shape[1] * 3, QImage.Format.Format_RGB888)
+        qimage = QImage(
+            rgb.data,
+            rgb.shape[1],
+            rgb.shape[0],
+            rgb.shape[1] * 3,
+            QImage.Format.Format_RGB888,
+        )
         self.video_label.setPixmap(QPixmap.fromImage(qimage.copy()))
-
-        # Only create the extra BGR copy when UI frame saving is enabled.
         self.last_render = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR) if save_render else None
 
     @property
@@ -974,94 +996,71 @@ class DetectionDisplay(_PilRenderer):
     def _update_panel(self, ui: dict[str, Any]) -> None:
         status, color_key, subtitle = self._status_values(ui)
         self.status_title.setText(status)
-        self.status_title.setStyleSheet(f"color: {_hex(color_key)};")
+        self.status_dot.setStyleSheet(f"color: {_hex(color_key)}; border: none;")
         self.status_subtitle.setText(subtitle)
 
-        camera_ok = bool(ui.get("camera_ok"))
         index = int(ui.get("waypoint_index", 0))
         total = max(1, int(ui.get("waypoints_total", 1)))
         round_no = int(ui.get("patrol_round", 0))
         altitude = -float(ui.get("altitude", 0.0))
         speed = float(ui.get("speed", 0.0))
-        capture_fps = float(ui.get("capture_fps", 0.0))
         detection_fps = float(ui.get("detection_fps", 0.0))
-        inference_ms = float(ui.get("inference_ms", 0.0))
         detection_latency_ms = float(ui.get("detection_latency_ms", 0.0))
-        capture_rpc_avg_ms = float(ui.get("capture_rpc_avg_ms", ui.get("capture_rpc_ms", 0.0)))
-        capture_rpc_max_ms = float(ui.get("capture_rpc_max_ms", 0.0))
-        image_parse_avg_ms = float(ui.get("image_parse_avg_ms", 0.0))
-        image_parse_max_ms = float(ui.get("image_parse_max_ms", 0.0))
-        detection_avg_ms = float(ui.get("detection_avg_ms", inference_ms))
-        detection_max_ms = float(ui.get("detection_max_ms", 0.0))
-        render_fps = float(ui.get("render_fps", 0.0))
-        camera_drops = int(ui.get("camera_drops", 0))
-        detection_drops = int(ui.get("detection_drops", 0))
-        detection_latency_avg_ms = float(ui.get("detection_latency_avg_ms", detection_latency_ms))
-        detection_latency_max_ms = float(ui.get("detection_latency_max_ms", 0.0))
+
         boxes = (
             self.last_snapshot.boxes
             if self.last_snapshot is not None and self._detection_fresh
             else ()
         )
-        # 同步有效目标数（只统计与当前画面匹配的新鲜结果），紧凑状态条据此显示
-        ui["detections"] = len(boxes)
+        # 小卡片赋值
+        self.tile_alt.set_value(f"{altitude:.1f}")
+        self.tile_spd.set_value(f"{speed:.2f}")
+        self.tile_fps.set_value(f"{detection_fps:.1f}")
+        self.tile_lat.set_value(f"{detection_latency_ms:.0f}")
 
-        self.card_camera.setText(
-            f"相机状态：{'已连接' if camera_ok else '等待连接'}    目标：{len(boxes)} 个"
-        )
-        self.card_waypoint.setText(f"航点进度：{min(index, total):02d} / {total:02d}    第 {round_no} 圈")
-        self.card_flight.setText(f"飞行高度：{altitude:.1f} 米    速度：{speed:.2f} 米/秒")
-        self.card_performance.setText(
-            f"采集：{capture_fps:.1f} 帧/秒    取图：{capture_rpc_avg_ms:.0f}/{capture_rpc_max_ms:.0f} 毫秒    "
-            f"解析：{image_parse_avg_ms:.1f}/{image_parse_max_ms:.1f} 毫秒\n"
-            f"推理：{detection_fps:.1f} 帧/秒    YOLO：{detection_avg_ms:.0f}/{detection_max_ms:.0f} 毫秒    "
-            f"GUI：{render_fps:.1f} 帧/秒"
-        )
-        self.card_drops.setText(
-            f"累计丢帧：相机 {camera_drops}    检测 {detection_drops}    "
-            f"延迟：{detection_latency_avg_ms:.0f}/{detection_latency_max_ms:.0f} 毫秒"
-        )
-
+        # 进度更新
         self.progress.setRange(0, total)
         self.progress.setValue(min(index, total))
-        self.round_label.setText(f"{min(index, total):02d} / {total:02d} · 第 {round_no} 圈")
+        self.round_label.setText(f"第 {round_no} 圈 · {min(index, total)}/{total} 航点")
         self.route_widget.set_progress(total, index)
 
-        if boxes and self._detection_fresh:
-            # 显示全部检测目标：按置信度降序，逐行着色
+        # 目标展示 Tag (纯色充填，彻底无描边)。
+        # boxes 已按新鲜度过滤：非空 = 新鲜且有目标。
+        # 三态：新鲜有目标 → 标签；无快照或新鲜但无目标 → “无检测目标”；
+        # 有快照但检测帧已滑出显示历史（推理过慢/长时间无新结果）→ “检测更新中”。
+        if boxes:
             ordered = sorted(boxes, key=lambda box: float(box[5]), reverse=True)
-            lines = []
+            tags = []
             for box in ordered:
                 name = _display_name(box[6])
                 confidence = float(box[5])
-                color = "warning" if confidence < 0.45 else "primary"
-                lines.append(
-                    f'<span style="color:{_hex(color)}; font-size:15px; font-weight:600;">'
-                    f"{name}  {confidence:.0%}</span>"
+
+                if confidence >= 0.45:
+                    bg_color = _hex("primary_soft")
+                    text_color = _hex("primary")
+                else:
+                    bg_color = _hex("warning_soft")
+                    text_color = _hex("warning")
+
+                tags.append(
+                    f'<span style="background-color:{bg_color}; color:{text_color};'
+                    f' padding: 4px 10px; border-radius: 12px; font-weight:600; font-size:12px;">'
+                    f"{name} {confidence:.0%}</span>"
                 )
-            self.target_label.setText("<br>".join(lines))
+
+            self.target_label.setText("  ".join(tags))
             self.target_label.setTextFormat(Qt.TextFormat.RichText)
             self.target_label.setWordWrap(True)
-            self.target_label.setStyleSheet("")
-        elif boxes:
-            # 检测结果已过期（帧不同步）：不显示旧目标，避免与画面错位
+            self.target_label.setStyleSheet("border: none;")
+        elif self.last_snapshot is None or self._detection_fresh:
+            self.target_label.setText("当前画面无检测目标")
+            self.target_label.setTextFormat(Qt.TextFormat.PlainText)
+            self.target_label.setStyleSheet(
+                f"color: {_hex('muted_light')}; border: none;"
+            )
+        else:
             self.target_label.setText("检测更新中…")
             self.target_label.setTextFormat(Qt.TextFormat.PlainText)
-            self.target_label.setWordWrap(True)
-            self.target_label.setStyleSheet(f"color: {_hex('muted_light')};")
-        else:
-            self.target_label.setText("当前画面没有检测目标")
-            self.target_label.setTextFormat(Qt.TextFormat.PlainText)
-            self.target_label.setWordWrap(True)
-            self.target_label.setStyleSheet(f"color: {_hex('muted_light')};")
-
-        self.status_strip.set_values(ui)
-
-    def _update_compact(self) -> None:
-        """窗口过窄/过矮时切换为底部紧凑状态条。"""
-        compact = (
-            self._window.width() < self.COMPACT_MIN_WIDTH
-            or self._window.height() < self.COMPACT_MIN_HEIGHT
-        )
-        self.right_panel.setVisible(not compact)
-        self.status_strip.setVisible(compact)
+            self.target_label.setStyleSheet(
+                f"color: {_hex('muted_light')}; border: none;"
+            )
