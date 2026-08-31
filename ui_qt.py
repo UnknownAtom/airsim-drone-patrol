@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import time
 from collections import deque
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -206,6 +207,17 @@ def _clip(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
 
 
+@lru_cache(maxsize=8)
+def _rounded_mask(size: tuple[int, int], radius: int) -> Image.Image:
+    """Return a reusable immutable-in-practice mask for a stable video size."""
+    mask = Image.new("L", size, 0)
+    mask_draw = ImageDraw.Draw(mask)
+    mask_draw.rounded_rectangle(
+        (0, 0, size[0] - 1, size[1] - 1), radius=radius, fill=255
+    )
+    return mask
+
+
 def _paste_rounded(
     canvas: Image.Image,
     source: Image.Image,
@@ -214,12 +226,7 @@ def _paste_rounded(
     radius: int = 20,
 ) -> None:
     resized = source.resize(size, Image.Resampling.BILINEAR).convert("RGBA")
-    mask = Image.new("L", size, 0)
-    mask_draw = ImageDraw.Draw(mask)
-    mask_draw.rounded_rectangle(
-        (0, 0, size[0] - 1, size[1] - 1), radius=radius, fill=255
-    )
-    canvas.paste(resized, xy, mask)
+    canvas.paste(resized, xy, _rounded_mask(size, radius))
 
 
 class _PilRenderer:
@@ -343,7 +350,7 @@ class _PilRenderer:
         frame = self.last_packet.frame
         source_h, source_w = frame.shape[:2]
         px, py, pw, ph, scale = _fit_image(source_w, source_h, image_box)
-        image = Image.fromarray(frame).convert("RGB")
+        image = Image.fromarray(frame)
         _paste_rounded(
             canvas,
             image,
@@ -596,15 +603,16 @@ class MetricTile(QFrame):
         self.label_val.setStyleSheet(f"color: {_hex('text')}; border: none;")
 
         self._unit = unit
+        self._last_value: str | None = None
 
         layout.addWidget(self.label_title)
         layout.addWidget(self.label_val)
 
     def set_value(self, val_str: str) -> None:
-        if self._unit:
-            self.label_val.setText(f"{val_str} {self._unit}")
-        else:
-            self.label_val.setText(val_str)
+        value = f"{val_str} {self._unit}" if self._unit else val_str
+        if value != self._last_value:
+            self.label_val.setText(value)
+            self._last_value = value
 
 
 class _MainWindow(QMainWindow):
@@ -945,7 +953,9 @@ class DetectionDisplay(_PilRenderer):
             rgb.shape[1] * 3,
             QImage.Format.Format_RGB888,
         )
-        self.video_label.setPixmap(QPixmap.fromImage(qimage.copy()))
+        # QPixmap owns its converted pixels; avoid an extra full-frame QImage
+        # copy on every display refresh.
+        self.video_label.setPixmap(QPixmap.fromImage(qimage))
         self.last_render = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR) if save_render else None
 
     @property

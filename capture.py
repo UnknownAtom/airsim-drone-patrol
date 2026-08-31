@@ -2,15 +2,14 @@
 
 - ``read_scene_frame``：读取原始 Scene 帧，并返回分项耗时（RPC/解析）；
 - ``CaptureWorker``：独立相机线程，连接失败无限重试，连续取图失败自动重连；
-- ``put_latest``：只保留最新帧的覆盖式入队。
+- ``LatestValueQueue``：向检测与显示发布彼此独立的最新帧通道。
 
-依赖 ``detector``（把帧提交给检测线程），不依赖项目内其他模块。
+不依赖检测或 GUI 模块；仅发布中立的帧消息。
 """
 
 from __future__ import annotations
 
 import argparse
-import queue
 import threading
 import time
 from dataclasses import dataclass
@@ -22,7 +21,7 @@ import cv2
 import numpy as np
 
 from airsim_connection import close_client, new_client
-from detector import DetectionWorker
+from frame_stream import FramePacket, LatestValueQueue
 from performance import RateWindow, RollingStats, StatsSnapshot
 
 
@@ -100,12 +99,6 @@ def _elapsed_ms(started: float) -> float:
     return max(0.0, (time.perf_counter() - started) * 1000.0)
 
 
-@dataclass(frozen=True)
-class FramePacket:
-    frame: np.ndarray
-    frame_id: int
-
-
 class CaptureWorker:
     """Continuously acquire raw AirSim frames independently of flight control.
 
@@ -116,15 +109,15 @@ class CaptureWorker:
 
     def __init__(
         self,
-        detector: DetectionWorker,
-        frame_queue: queue.Queue[FramePacket],
+        display_frames: LatestValueQueue[FramePacket],
+        detection_frames: LatestValueQueue[FramePacket],
         args: argparse.Namespace,
         stop_event: threading.Event,
         ui: dict[str, Any],
         state_lock: threading.Lock,
     ) -> None:
-        self.detector = detector
-        self.frame_queue = frame_queue
+        self.display_frames = display_frames
+        self.detection_frames = detection_frames
         self.args = args
         self.stop_event = stop_event
         self.ui = ui
@@ -229,8 +222,10 @@ class CaptureWorker:
                     self.ui["camera_ok"] = True
                     self.ui["camera_error"] = ""
 
-                frame_id = self.detector.submit(frame)
-                if put_latest(self.frame_queue, FramePacket(frame, frame_id)):
+                frame_id = self.frames_captured
+                packet = FramePacket(frame, frame_id)
+                self.detection_frames.put_latest(packet)
+                if self.display_frames.put_latest(packet):
                     self.frames_dropped += 1
                 self._maybe_save_frame(frame, frame_id)
                 if self.args.debug and frame_id % 10 == 0:
@@ -290,22 +285,3 @@ class CaptureWorker:
             "parse": self.parse_stats.snapshot(),
             "capture": self.capture_stats.snapshot(),
         }
-
-
-def put_latest(target: queue.Queue[FramePacket], packet: FramePacket) -> bool:
-    """Put a packet while keeping only the newest one.
-
-    Returns True when an older packet had to be discarded. This is intentional
-    for a live view, but the counter is useful for diagnosing a slow GUI.
-    """
-    dropped = False
-    try:
-        target.get_nowait()
-        dropped = True
-    except queue.Empty:
-        pass
-    try:
-        target.put_nowait(packet)
-    except queue.Full:
-        dropped = True
-    return dropped

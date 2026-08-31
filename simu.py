@@ -41,8 +41,9 @@ from typing import Any
 
 import cv2
 
-from capture import CaptureWorker, FramePacket
+from capture import CaptureWorker
 from detector import DetectorBackend, DetectionWorker
+from frame_stream import FramePacket, LatestValueQueue
 from flight import flight_worker, load_waypoints, normalize_waypoints
 from ui_qt import DetectionDisplay
 
@@ -296,9 +297,13 @@ def main() -> None:
     waypoints = normalize_waypoints(load_waypoints(args.waypoints_file), args.cruise_z, args.max_speed)
     args.takeoff_z = args.cruise_z if args.takeoff_z is None else min(args.takeoff_z, args.cruise_z)
     backend = DetectorBackend(args.model, args)
-    detector = DetectionWorker(backend)
-    display = DetectionDisplay(args.theme)
-    frame_queue: queue.Queue[FramePacket] = queue.Queue(maxsize=1)
+    display_frames: LatestValueQueue[FramePacket] = LatestValueQueue()
+    detection_frames: LatestValueQueue[FramePacket] = LatestValueQueue()
+    detector = DetectionWorker(backend, detection_frames)
+    # A headless patrol should not construct QApplication, widgets, fonts or
+    # PIL rendering state.  Besides lowering start-up cost, this allows the
+    # inference-only path to run on machines without a usable display server.
+    display = None if args.no_display else DetectionDisplay(args.theme)
     stop_event = threading.Event()
     done_event = threading.Event()
     state_lock = threading.Lock()
@@ -343,14 +348,14 @@ def main() -> None:
         daemon=True,
     )
 
-    if not args.no_display:
+    if display is not None:
         # Qt 窗口在首次 show() 时创建并显示；先渲染一次空状态画面，
         # 避免窗口是空白灰框。
         display.show(None, None, args, ui)
 
     capture_worker = CaptureWorker(
-        detector=detector,
-        frame_queue=frame_queue,
+        display_frames=display_frames,
+        detection_frames=detection_frames,
         args=args,
         stop_event=stop_event,
         ui=ui,
@@ -360,11 +365,12 @@ def main() -> None:
     capture_worker.start()
 
     last_saved_render_count = 0
+    next_metrics_refresh_at = 0.0
     try:
         while not done_event.is_set():
             raw_frame = None
             try:
-                raw_frame = frame_queue.get_nowait()
+                raw_frame = display_frames.get_nowait()
             except queue.Empty:
                 pass
 
@@ -372,29 +378,34 @@ def main() -> None:
             if args.debug and snapshot is not None:
                 print(f"[DEBUG] detect frame_id={snapshot.frame_id}")
 
-            # Refresh only values consumed by the Qt panel.
-            ui["capture_fps"] = capture_worker.capture_fps
-            ui["detection_fps"] = detector.inference_fps
-            ui["camera_drops"] = capture_worker.frames_dropped
-            ui["detection_drops"] = detector.jobs_dropped
-            capture_perf = capture_worker.performance_snapshot()
-            capture_rpc = capture_perf["rpc"]
-            ui["capture_rpc_avg_ms"] = capture_rpc.average_ms
-            ui["capture_rpc_max_ms"] = capture_rpc.maximum_ms
-            detector_perf = detector.performance_snapshot
-            inference = detector_perf["inference"]
-            ui["detection_avg_ms"] = inference.average_ms
-            ui["detection_max_ms"] = inference.maximum_ms
-            if not args.no_display:
+            # These counters are shown only by the GUI.  Sampling them once
+            # per display period avoids lock acquisition and statistics work
+            # on every 10 ms coordinator-loop pass.
+            now = time.monotonic()
+            if display is not None and now >= next_metrics_refresh_at:
+                ui["capture_fps"] = capture_worker.capture_fps
+                ui["detection_fps"] = detector.inference_fps
+                ui["camera_drops"] = capture_worker.frames_dropped
+                ui["detection_drops"] = detector.jobs_dropped
+                capture_rpc = capture_worker.performance_snapshot()["rpc"]
+                ui["capture_rpc_avg_ms"] = capture_rpc.average_ms
+                ui["capture_rpc_max_ms"] = capture_rpc.maximum_ms
+                inference = detector.performance_snapshot["inference"]
+                ui["detection_avg_ms"] = inference.average_ms
+                ui["detection_max_ms"] = inference.maximum_ms
                 ui["render_fps"] = display.render_fps
+                next_metrics_refresh_at = now + 1.0 / max(1.0, args.display_fps)
 
-            if raw_frame is not None or snapshot is not None:
+            if display is None:
+                should_quit = False
+            elif raw_frame is not None or snapshot is not None:
                 should_quit = display.show(raw_frame, snapshot, args, ui)
             else:
-                should_quit = False if args.no_display else display.process_events()
+                should_quit = display.process_events()
 
             if (
-                args.save_ui_every > 0
+                display is not None
+                and args.save_ui_every > 0
                 and display.last_render is not None
                 and display.render_count != last_saved_render_count
             ):
@@ -423,7 +434,7 @@ def main() -> None:
         shutdown_deadline = time.monotonic() + 30.0
         while worker.is_alive() and time.monotonic() < shutdown_deadline:
             worker.join(timeout=0.1)
-            if not args.no_display:
+            if display is not None:
                 display.process_events()
         capture_worker.close()
 

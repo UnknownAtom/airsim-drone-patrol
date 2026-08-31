@@ -108,6 +108,7 @@ simu.py              组装入口
 flight.py            航点/碰撞/飞行线程（含断线重连）
 airsim_connection.py AirSim 客户端创建/释放辅助
 capture.py           相机/取图线程
+frame_stream.py      采集、检测与显示之间的中立最新帧通道
 detector.py          YOLO 加载/推理/检测线程
 performance.py       滚动耗时统计与 FPS 窗口
 benchmark_capture.py 取图基准工具（不加载 YOLO/不起飞）

@@ -21,6 +21,7 @@ class RollingStats:
     def __init__(self, max_samples: int = 120) -> None:
         self.max_samples = max(1, int(max_samples))
         self._samples: deque[float] = deque(maxlen=self.max_samples)
+        self._recent_total_ms = 0.0
         self._total_count = 0
         self._maximum_ms = 0.0
         self._lock = threading.Lock()
@@ -28,7 +29,10 @@ class RollingStats:
     def add(self, value_ms: float) -> None:
         value = max(0.0, float(value_ms))
         with self._lock:
+            if len(self._samples) == self.max_samples:
+                self._recent_total_ms -= self._samples[0]
             self._samples.append(value)
+            self._recent_total_ms += value
             self._total_count += 1
             self._maximum_ms = max(self._maximum_ms, value)
 
@@ -38,7 +42,7 @@ class RollingStats:
                 return StatsSnapshot(count=self._total_count)
             return StatsSnapshot(
                 count=self._total_count,
-                average_ms=sum(self._samples) / len(self._samples),
+                average_ms=self._recent_total_ms / len(self._samples),
                 maximum_ms=self._maximum_ms,
             )
 
@@ -64,7 +68,10 @@ class RateWindow:
             if len(self._events) < 2:
                 return 0.0
             elapsed = max(0.001, timestamp - self._events[0])
-            return len(self._events) / min(self.seconds, elapsed)
+            # N timestamps describe N - 1 completed intervals.  Counting the
+            # initial event as a full interval overstates low rates and makes
+            # the FPS panel misleading while a stream is warming up.
+            return (len(self._events) - 1) / min(self.seconds, elapsed)
 
     def _prune(self, now: float) -> None:
         cutoff = now - self.seconds

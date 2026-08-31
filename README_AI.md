@@ -53,6 +53,7 @@
 | `simu.py` | 组装入口：参数解析、线程协调、GUI 主循环（原单文件拆分后的主程序） |
 | `flight.py` | 飞行模块：航点加载/钳制、碰撞监控、飞行线程 |
 | `capture.py` | 取图模块：相机连接/重连、帧采集线程、最新帧入队 |
+| `frame_stream.py` | 中立帧消息与单槽最新帧通道；采集向检测和 GUI 各发布一份最新帧 |
 | `airsim_connection.py` | AirSim 客户端创建、独立会话关闭和连接生命周期辅助 |
 | `performance.py` | 线程安全滚动耗时统计和最近窗口 FPS 统计 |
 | `benchmark_capture.py` | 独立相机基准工具，不加载 YOLO、不起飞，测试原始 Scene |
@@ -220,7 +221,7 @@ AirSim 飞行线程
     └─ 起飞、移动、航点判断、碰撞检查、降落
 
 AirSim 相机线程
-    └─ simGetImages → 最新原始帧 → 检测队列 + 显示队列
+    └─ simGetImages → FramePacket → 独立的检测/显示最新帧通道
 
 YOLO 检测线程
     └─ 取最新帧 → 推理 → 最新检测结果
@@ -230,6 +231,7 @@ PyQt6 GUI 主线程
 ```
 
 队列大小刻意设为 1，并且新帧会覆盖旧帧。这是为了降低延迟：实时画面宁可丢弃旧帧，也不能让检测线程处理几秒前的画面。
+`capture.py` 不导入检测或 GUI 模块；通道类型定义在 `frame_stream.py`，由 `simu.py` 在组装时连接生产者与消费者。
 
 阶段三的性能口径：
 

@@ -22,6 +22,7 @@ import numpy as np
 import torch
 from ultralytics import YOLO
 
+from frame_stream import FramePacket, LatestValueQueue
 from performance import RateWindow, RollingStats, StatsSnapshot
 
 
@@ -178,23 +179,29 @@ class DetectorBackend:
             ]
 
         result = self._predict(frame)[0]
-        boxes: list[ModelBox] = []
-        for box in result.boxes:
-            class_id = int(box.cls[0].item())
-            confidence = float(box.conf[0].item())
-            bbox = box.xyxy[0].detach().cpu().numpy().tolist()
-            boxes.append(
-                ModelBox(
-                    xmin=float(bbox[0]),
-                    ymin=float(bbox[1]),
-                    xmax=float(bbox[2]),
-                    ymax=float(bbox[3]),
-                    class_id=class_id,
-                    confidence=confidence,
-                    class_name=class_name(self.names, class_id),
-                )
+        result_boxes = result.boxes
+        if result_boxes is None or len(result_boxes) == 0:
+            return []
+
+        # Transfer the three result tensors only once.  The previous per-box
+        # ``.item()``/``.cpu()`` calls each force CUDA work to be visible to
+        # Python, which is especially expensive in crowded scenes.
+        coordinates = result_boxes.xyxy.detach().cpu().numpy()
+        class_ids = result_boxes.cls.detach().cpu().numpy().astype(np.intp, copy=False)
+        confidences = result_boxes.conf.detach().cpu().numpy()
+        names = getattr(result, "names", self.names)
+        return [
+            ModelBox(
+                xmin=float(coordinates[index, 0]),
+                ymin=float(coordinates[index, 1]),
+                xmax=float(coordinates[index, 2]),
+                ymax=float(coordinates[index, 3]),
+                class_id=int(class_ids[index]),
+                confidence=float(confidences[index]),
+                class_name=class_name(names, int(class_ids[index])),
             )
-        return boxes
+            for index in range(len(coordinates))
+        ]
 
 
 @dataclass(frozen=True)
@@ -219,17 +226,18 @@ class DetectionWorker:
     camera display keeps running.
     """
 
-    def __init__(self, backend: DetectorBackend) -> None:
+    def __init__(
+        self,
+        backend: DetectorBackend,
+        frames: LatestValueQueue[FramePacket],
+    ) -> None:
         self.backend = backend
-        self.frame_count = 0
-        self.jobs: queue.Queue[FrameJob] = queue.Queue(maxsize=1)
-        self.outputs: queue.Queue[DetectionSnapshot] = queue.Queue(maxsize=1)
+        self.frames = frames
+        self.outputs: LatestValueQueue[DetectionSnapshot] = LatestValueQueue()
         self.stop_event = threading.Event()
         self.error: Exception | None = None
         self.disabled = False
         self._last_error_message: str | None = None
-        self.jobs_dropped = 0
-        self.outputs_dropped = 0
         self.inferences_completed = 0
         self.last_inference_ms = 0.0
         self.first_inference_ms = 0.0
@@ -240,37 +248,20 @@ class DetectionWorker:
         self.thread = threading.Thread(target=self._run, name="yolo-detection", daemon=True)
         self.thread.start()
 
-    def submit(self, frame: np.ndarray) -> int:
-        self.frame_count += 1
-        frame_id = self.frame_count
-        submitted_monotonic = time.monotonic()
-        if self.disabled:
-            return frame_id
-        job = FrameJob(
-            frame=frame,
-            frame_id=frame_id,
-            submitted_monotonic=submitted_monotonic,
-        )
-        # Keep only the newest frame. A backlog would increase latency and make
-        # the display appear frozen even though the program is still running.
-        try:
-            self.jobs.get_nowait()
-            self.jobs_dropped += 1
-        except queue.Empty:
-            pass
-        try:
-            self.jobs.put_nowait(job)
-        except queue.Full:
-            self.jobs_dropped += 1
-        return frame_id
-
     def _run(self) -> None:
         consecutive_errors = 0
-        while not self.stop_event.is_set() or not self.jobs.empty():
+        while not self.stop_event.is_set() or not self.frames.empty():
             try:
-                job = self.jobs.get(timeout=0.05)
+                packet = self.frames.get(timeout=0.05)
             except queue.Empty:
                 continue
+            if self.disabled:
+                continue
+            job = FrameJob(
+                frame=packet.frame,
+                frame_id=packet.frame_id,
+                submitted_monotonic=packet.captured_monotonic,
+            )
             try:
                 self.backend.synchronize()
                 started = time.perf_counter()
@@ -292,20 +283,13 @@ class DetectionWorker:
                             box.class_name,
                         )
                     )
-                try:
-                    self.outputs.get_nowait()
-                except queue.Empty:
-                    pass
-                try:
-                    self.outputs.put_nowait(
-                        DetectionSnapshot(
-                            job.frame_id,
-                            tuple(snapshot_boxes),
-                            latency_ms,
-                        )
+                self.outputs.put_latest(
+                    DetectionSnapshot(
+                        job.frame_id,
+                        tuple(snapshot_boxes),
+                        latency_ms,
                     )
-                except queue.Full:
-                    self.outputs_dropped += 1
+                )
                 self.inferences_completed += 1
                 self.last_inference_ms = inference_ms
                 self.last_latency_ms = latency_ms
@@ -343,6 +327,19 @@ class DetectionWorker:
     @property
     def inference_fps(self) -> float:
         return self._inference_rate.rate()
+
+    @property
+    def frame_count(self) -> int:
+        """Number of frames accepted by the detection input channel."""
+        return self.frames.published
+
+    @property
+    def jobs_dropped(self) -> int:
+        return self.frames.dropped
+
+    @property
+    def outputs_dropped(self) -> int:
+        return self.outputs.dropped
 
     @property
     def performance_snapshot(self) -> dict[str, StatsSnapshot]:
