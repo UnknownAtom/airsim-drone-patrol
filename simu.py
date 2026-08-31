@@ -99,6 +99,12 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="AirSim + YOLO UAV patrol demo")
     parser.add_argument("--model", default=str(DEFAULT_MODEL), help="YOLO .pt model path")
+    parser.add_argument(
+        "--backend",
+        choices=("auto", "yolov5", "ultralytics"),
+        default="auto",
+        help="模型后端：auto 按文件名推断；yolov5 走旧版 Torch Hub；ultralytics 走新版",
+    )
     parser.add_argument("--conf", type=float, default=0.35, help="Detection confidence threshold")
     parser.add_argument("--iou", type=float, default=0.45, help="NMS IoU threshold")
     parser.add_argument("--device", default=None, help="Ultralytics device, e.g. 0 or cpu")
@@ -106,7 +112,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--half",
         action="store_true",
-        help="启用 FP16；CUDA/RTX 设备默认自动启用，CPU 会回退到 FP32",
+        help="兼容参数：CUDA 上默认即为 FP16，该开关仅为保留旧命令；用 --no-half 关闭",
+    )
+    parser.add_argument(
+        "--no-half",
+        action="store_true",
+        help="强制 FP32 推理（即使 CUDA 可用也不使用 FP16）",
     )
     parser.add_argument("--camera", default="0", help="AirSim camera name")
     parser.add_argument(
@@ -217,6 +228,11 @@ def parse_args() -> argparse.Namespace:
         help="Save every Nth rendered UI frame as PNG under --capture-dir (0 = off)",
     )
     parser.add_argument("--capture-dir", default=str(DEFAULT_CAPTURE_DIR), help="Directory for saved frames")
+    parser.add_argument(
+        "--log-file",
+        default=None,
+        help="将终端输出同时追加写入该文件（调试排查用）",
+    )
     parser.add_argument("--debug", action="store_true", help="Print frame and waypoint diagnostics")
     parser.add_argument(
         "--takeoff-z",
@@ -227,6 +243,36 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     _validate_args(parser, args)
     return args
+
+
+def _install_log_tee(path: str) -> None:
+    """Mirror stdout/stderr into a log file so GUI runs keep a full trace."""
+    import sys
+
+    log_stream = open(path, "a", encoding="utf-8", buffering=1)
+
+    class _Tee:
+        def __init__(self, primary, mirror):
+            self.primary = primary
+            self.mirror = mirror
+
+        def write(self, text):
+            self.primary.write(text)
+            self.mirror.write(text)
+
+        def flush(self):
+            self.primary.flush()
+            self.mirror.flush()
+
+        def fileno(self):
+            return self.primary.fileno()
+
+        def isatty(self):
+            return self.primary.isatty()
+
+    sys.stdout = _Tee(sys.stdout, log_stream)
+    sys.stderr = _Tee(sys.stderr, log_stream)
+    print(f"[MAIN] 日志已写入：{path}")
 
 
 def print_summary(
@@ -278,7 +324,7 @@ def print_summary(
     print(f"  飞行 RPC 失败   : {ui.get('rpc_failures', 0)}")
     print(f"  相机连接尝试    : {capture_worker.connect_attempts}")
     if detector.disabled:
-        print("  [DETECTOR] 检测因连续失败已禁用（画面显示不受影响）")
+        print("  [DETECTOR] 检测失败已暂停，将在重试窗口后自动恢复（画面显示不受影响）")
     if detector.error is not None:
         print(f"  [DETECTOR] 检测线程错误: {type(detector.error).__name__}: {detector.error}")
     if capture_worker.error is not None:
@@ -294,8 +340,14 @@ def print_summary(
 
 def main() -> None:
     args = parse_args()
+    if args.log_file:
+        _install_log_tee(args.log_file)
     waypoints = normalize_waypoints(load_waypoints(args.waypoints_file), args.cruise_z, args.max_speed)
     args.takeoff_z = args.cruise_z if args.takeoff_z is None else min(args.takeoff_z, args.cruise_z)
+    # 每次运行使用独立的保存子目录，避免多次运行互相覆盖同名帧。
+    args.capture_run_dir = str(
+        Path(args.capture_dir) / time.strftime("run_%Y%m%d_%H%M%S")
+    )
     backend = DetectorBackend(args.model, args)
     display_frames: LatestValueQueue[FramePacket] = LatestValueQueue()
     detection_frames: LatestValueQueue[FramePacket] = LatestValueQueue()
@@ -351,7 +403,7 @@ def main() -> None:
     if display is not None:
         # Qt 窗口在首次 show() 时创建并显示；先渲染一次空状态画面，
         # 避免窗口是空白灰框。
-        display.show(None, None, args, ui)
+        display.show(None, None, args, ui, state_lock)
 
     capture_worker = CaptureWorker(
         display_frames=display_frames,
@@ -399,7 +451,7 @@ def main() -> None:
             if display is None:
                 should_quit = False
             elif raw_frame is not None or snapshot is not None:
-                should_quit = display.show(raw_frame, snapshot, args, ui)
+                should_quit = display.show(raw_frame, snapshot, args, ui, state_lock)
             else:
                 should_quit = display.process_events()
 
@@ -411,7 +463,7 @@ def main() -> None:
             ):
                 last_saved_render_count = display.render_count
                 if display.render_count % args.save_ui_every == 0:
-                    save_dir = Path(args.capture_dir)
+                    save_dir = Path(args.capture_run_dir)
                     save_dir.mkdir(parents=True, exist_ok=True)
                     cv2.imwrite(
                         str(save_dir / f"ui_{display.render_count:05d}.png"),

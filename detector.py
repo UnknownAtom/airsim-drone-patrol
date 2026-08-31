@@ -62,8 +62,10 @@ class DetectorBackend:
 
     def __init__(self, model_path: str | Path, args: argparse.Namespace) -> None:
         self.model_path = Path(model_path).expanduser().resolve()
+        if not self.model_path.is_file():
+            raise FileNotFoundError(f"模型文件不存在：{self.model_path}")
         self.args = args
-        self.is_yolov5 = "yolov5" in self.model_path.name.lower()
+        self.is_yolov5 = self._resolve_backend(getattr(args, "backend", "auto"))
         self.device = normalize_torch_device(args.device)
         self.use_half = self._resolve_half()
         self.model_load_ms = 0.0
@@ -90,6 +92,19 @@ class DetectorBackend:
         if self.warmup_ms > 0:
             print(f"模型预热完成：{self.warmup_ms:.1f} ms")
 
+    def _resolve_backend(self, backend: str | None) -> bool:
+        """Decide between legacy Torch Hub YOLOv5 and current Ultralytics.
+
+        ``--backend`` 显式指定最可靠；``auto`` 保留按文件名推断的旧行为
+        （仅作兼容，文件名含 "yolov5" 即走 Torch Hub）。
+        """
+        backend = (backend or "auto").strip().lower()
+        if backend == "yolov5":
+            return True
+        if backend == "ultralytics":
+            return False
+        return "yolov5" in self.model_path.name.lower()
+
     def _load_yolov5(self) -> Any:
         """Load the legacy checkpoint through the official YOLOv5 hub code."""
         cached_repo = Path.home() / ".cache" / "torch" / "hub" / "ultralytics_yolov5_master"
@@ -99,6 +114,11 @@ class DetectorBackend:
         else:
             source = "github"
             repo = "ultralytics/yolov5"
+            print(
+                "[DETECTOR] 未找到本地 YOLOv5 hub 缓存，将从 GitHub 下载并执行"
+                " ultralytics/yolov5 代码（首次运行需联网；建议预下载到 "
+                "~/.cache/torch/hub/ultralytics_yolov5_master 以便离线使用）"
+            )
 
         model = torch.hub.load(
             repo,
@@ -114,12 +134,16 @@ class DetectorBackend:
         return model
 
     def _resolve_half(self) -> bool:
-        requested = bool(getattr(self.args, "half", False))
         cuda_available = torch.cuda.is_available() and self.device.startswith("cuda")
-        if requested and not cuda_available:
-            print("[DETECTOR] --half 需要 CUDA，当前设备改用 FP32")
-        # RTX/CUDA uses FP16 by default; --half makes the intent explicit.
-        return cuda_available
+        if not cuda_available:
+            if getattr(self.args, "half", False):
+                print("[DETECTOR] --half 需要 CUDA，当前设备改用 FP32")
+            return False
+        if getattr(self.args, "no_half", False):
+            print("[DETECTOR] --no-half 已指定，推理使用 FP32")
+            return False
+        # CUDA 默认 FP16（性能模式）；--half 仅为兼容旧命令，--no-half 可强制 FP32。
+        return True
 
     def synchronize(self) -> None:
         if self.device.startswith("cuda") and torch.cuda.is_available():
@@ -245,17 +269,28 @@ class DetectionWorker:
         self.inference_stats = RollingStats()
         self.latency_stats = RollingStats()
         self._inference_rate = RateWindow(seconds=3.0)
+        self.retry_seconds = 10.0
+        self._retry_at = 0.0
         self.thread = threading.Thread(target=self._run, name="yolo-detection", daemon=True)
         self.thread.start()
 
     def _run(self) -> None:
         consecutive_errors = 0
         while not self.stop_event.is_set() or not self.frames.empty():
+            if self.disabled:
+                if self.stop_event.is_set():
+                    break
+                if time.monotonic() >= self._retry_at:
+                    self.disabled = False
+                    consecutive_errors = 0
+                    self._last_error_message = None
+                    print("[DETECTOR] 检测自动重试：恢复推理")
+                else:
+                    time.sleep(0.05)
+                    continue
             try:
                 packet = self.frames.get(timeout=0.05)
             except queue.Empty:
-                continue
-            if self.disabled:
                 continue
             job = FrameJob(
                 frame=packet.frame,
@@ -309,8 +344,11 @@ class DetectionWorker:
                     self.error = exc
                 if consecutive_errors >= 5:
                     self.disabled = True
-                    print("[DETECTOR] 连续推理失败，已停止检测；画面显示继续。")
-                    break
+                    self._retry_at = time.monotonic() + self.retry_seconds
+                    print(
+                        "[DETECTOR] 连续推理失败，暂停检测"
+                        f"（{self.retry_seconds:g} 秒后自动重试）；画面显示继续。"
+                    )
 
     def poll_snapshot(self) -> DetectionSnapshot | None:
         latest = None

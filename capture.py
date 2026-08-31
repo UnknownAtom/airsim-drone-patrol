@@ -250,7 +250,11 @@ class CaptureWorker:
         if frame_id % self.args.save_every != 0:
             return
         try:
-            save_dir = Path(self.args.capture_dir)
+            # 每次运行写入独立子目录（simu.py 注入 capture_run_dir），
+            # 避免多次运行互相覆盖同名帧；benchmark 等直接使用时回退 capture_dir。
+            save_dir = Path(
+                getattr(self.args, "capture_run_dir", None) or self.args.capture_dir
+            )
             save_dir.mkdir(parents=True, exist_ok=True)
             # AirSim Scene 是 RGB 顺序，cv2.imwrite 按 BGR 保存：仅落盘时转换，
             # 内存帧与 YOLO 推理输入保持原始顺序不变。

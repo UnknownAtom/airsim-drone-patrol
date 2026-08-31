@@ -10,7 +10,9 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class StatsSnapshot:
-    count: int = 0
+    # 注意：total_count 是自统计开始以来的累计样本数，
+    # 而 average_ms / maximum_ms 只反映最近窗口内的样本。
+    total_count: int = 0
     average_ms: float = 0.0
     maximum_ms: float = 0.0
 
@@ -39,9 +41,9 @@ class RollingStats:
     def snapshot(self) -> StatsSnapshot:
         with self._lock:
             if not self._samples:
-                return StatsSnapshot(count=self._total_count)
+                return StatsSnapshot(total_count=self._total_count)
             return StatsSnapshot(
-                count=self._total_count,
+                total_count=self._total_count,
                 average_ms=self._recent_total_ms / len(self._samples),
                 maximum_ms=self._maximum_ms,
             )

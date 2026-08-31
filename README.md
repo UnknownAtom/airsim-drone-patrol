@@ -24,7 +24,9 @@ simu.py
  ├── detector.py 检测模块：模型加载/推理/检测线程
  ├── performance.py  性能滚动统计与 FPS 窗口
  ├── benchmark_capture.py  不启动飞行的原始 Scene 取图基准工具
- └── ui_qt.py   界面模块：PyQt6 前端（左视频 PIL + 右侧任务控制面板）
+ ├── ui_qt.py   界面组装：PyQt6 前端（左视频 + 右侧任务控制面板）
+ ├── ui_theme.py  UI 主题令牌、颜色和字体
+ └── ui_components.py  Fluent 控件、指标卡、航点路线和检测目标卡片
 ```
 
 配置文件：`waypoints.json`（巡航航点）、`settings_airsimnh_hd.json`（1280×720 相机配置示例）；详细说明见 `README_AI.md`。
@@ -75,9 +77,11 @@ python simu.py --display-width 1280 --display-height 720 --display-fps 18
 | 参数 | 默认值 | 说明 |
 |---|---:|---|
 | `--model` | `visdrone-yolov26l.pt` | 模型路径（Ultralytics 或 其他格式） |
+| `--backend` | `auto` | 模型后端：`auto` 按文件名推断；`yolov5` 走 Torch Hub；`ultralytics` 走新版 |
 | `--conf` / `--iou` | `0.35` / `0.45` | 置信度 / NMS IoU 阈值 |
 | `--imgsz` | `640` | YOLO 推理尺寸 |
-| `--half` | 自动 | CUDA/RTX 默认 FP16；CPU 自动回退 FP32 |
+| `--half` | 自动 | 兼容参数；CUDA 默认 FP16，CPU 自动回退 FP32 |
+| `--no-half` | 关闭 | 强制 FP32 推理（即使 CUDA 可用） |
 | `--capture-fps` | `25` | 相机目标采集帧率，实际值受 AirSim RPC 延迟限制 |
 | `--display-fps` | `18` | GUI 最大渲染帧率，不限制相机采集 |
 | `--display-width` / `--display-height` | `1600` / `900` | GUI 初始窗口尺寸 |
@@ -86,7 +90,8 @@ python simu.py --display-width 1280 --display-height 720 --display-fps 18
 | `--loops` | `1` | 巡航圈数，`0` 表示持续巡航 |
 | `--cruise-z` | `-15` | 巡航高度（NED 坐标，负值向上） |
 | `--max-speed` | `2.0` | 速度上限（m/s） |
-| `--save-every N` | `0` | 每 N 帧保存一张原始帧到 `captures/` |
+| `--save-every N` | `0` | 每 N 帧保存一张原始帧到 `captures/run_<时间戳>/` |
+| `--log-file` | 无 | 将终端输出同时追加写入指定文件 |
 | `--debug` | 关闭 | 输出帧号与航点诊断信息 |
 | `--airsim-ip` / `--airsim-port` | `127.0.0.1` / `41451` | AirSim RPC 地址与端口 |
 | `--airsim-timeout` | `5` | 单次 AirSim RPC 超时时间（秒） |
@@ -112,7 +117,9 @@ frame_stream.py      采集、检测与显示之间的中立最新帧通道
 detector.py          YOLO 加载/推理/检测线程
 performance.py       滚动耗时统计与 FPS 窗口
 benchmark_capture.py 取图基准工具（不加载 YOLO/不起飞）
-ui_qt.py             PyQt6 界面
+ui_qt.py             PyQt6 主窗口与状态适配
+ui_theme.py          UI 颜色、字体和设计令牌
+ui_components.py     Fluent 控件、指标卡、航点路线和检测目标卡片
 waypoints.json       巡航航点
 settings_airsimnh_hd.json  1280×720 相机配置示例
 README_AI.md         面向 AI 助手的详细项目说明

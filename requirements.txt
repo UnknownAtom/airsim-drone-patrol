@@ -1,8 +1,9 @@
 airsim
-ultralytics
+# quantize=16（FP16）参数需要 8.4+；<9 防止未来大版本破坏兼容
+ultralytics>=8.4,<9
 torch
 torchvision
 opencv-python
 numpy
-pillow
 PyQt6
+PyQt6-Fluent-Widgets

@@ -16,13 +16,13 @@
 
 ## 2. 当前运行状态
 
-当前主程序是 `simu.py`（组装入口）。飞行/取图/检测逻辑分别在 `flight.py`、`capture.py`、`detector.py` 中，界面在 `ui_qt.py`（自包含的 PyQt6 Widgets 前端，左侧 PIL 视频区 + 右侧任务控制面板）。整体包含：
+当前主程序是 `simu.py`（组装入口）。飞行/取图/检测逻辑分别在 `flight.py`、`capture.py`、`detector.py` 中，界面由 `ui_qt.py`、`ui_theme.py` 和 `ui_components.py` 组成（PyQt6 + PyQt-Fluent-Widgets，左侧 QPainter 视频区 + 右侧任务控制面板）。整体包含：
 
 - AirSim 多航点巡航；
 - 起飞、爬升、航点移动、悬停和降落；
 - 独立相机采集线程；
 - 独立 YOLO 检测线程；
-- PyQt6 GUI 主线程显示，视频画面内部使用 PIL 绘制；
+- PyQt6 GUI 主线程显示，视频画面内部使用 QPainter 绘制；
 - 只保留最新帧，避免检测队列堆积造成“画面停在第一帧”；
 - AirSim 相机连接失败后的重试和重连；
 - 飞行中 RPC 断线后的重新连接、重新确认场景和按当前位置恢复当前航点；
@@ -32,11 +32,11 @@
 - 可选保存原始相机帧用于排查取图问题。
 - 检测结果会校验对应帧是否进入显示历史，拒绝未来帧和过期帧的错误叠加；
 - 飞行线程发布 `DISCONNECTED/CONNECTING/READY/TAKING_OFF/CRUISING/STOPPING/LANDING/ERROR/STOPPED` 状态；
-- 界面显示任务状态、采集/推理/GUI FPS、取图与 YOLO 耗时、相机/检测丢帧和当前检测目标；完整统计仍保留在终端摘要；
+- 界面显示任务状态、采集/推理/GUI FPS、取图与 YOLO 耗时、检测延迟、相机/检测丢帧和当前检测目标；完整统计仍保留在终端摘要；
 - 阶段三增加取图 RPC、图像解析、YOLO、GUI 渲染的滚动平均/最大耗时和最近窗口 FPS；
 - 固定使用原始 Scene 采集模式；压缩 Scene 实测会降低当前本机采集性能，相关分支已移除；
 - CUDA/RTX 自动使用 FP16，模型启动时预热，并记录模型加载、预热和真实首帧推理耗时；
-- GUI 默认限制为 18 FPS，采集线程仍可独立按 25 FPS 调度；无新画面时跳过 PIL 重绘；
+- GUI 默认限制为 18 FPS，采集线程仍可独立按 25 FPS 调度；无新画面时跳过视频控件重绘；
 - 启动时校验 AirSim 端口、超时、模型阈值、图像尺寸、巡航速度等参数。
 
 当前不应默认恢复：
@@ -58,7 +58,9 @@
 | `performance.py` | 线程安全滚动耗时统计和最近窗口 FPS 统计 |
 | `benchmark_capture.py` | 独立相机基准工具，不加载 YOLO、不起飞，测试原始 Scene |
 | `detector.py` | 检测模块：YOLO 模型加载/推理、检测线程、检测快照 |
-| `ui_qt.py` | PyQt6 前端：左侧 PIL 视频区（检测框/HUD）+ 右侧任务控制面板（状态/指标/进度/目标/按钮） |
+| `ui_qt.py` | 主窗口组装和状态适配：左侧 QPainter 视频区 + 右侧任务控制面板 |
+| `ui_theme.py` | UI 颜色、字体和共享设计令牌 |
+| `ui_components.py` | Fluent 控件、指标卡、航点路线和检测目标卡片 |
 | `settings.json` | AirSim 用户配置，建议明确设置 `SimMode: Multirotor` 和相机分辨率 |
 | `waypoints.json` | 当前巡航航点配置 |
 | `visdrone-yolov26l.pt` | 默认主模型（Ultralytics 格式，VisDrone 10 类 + others） |
@@ -71,7 +73,7 @@
 
 前端不再依赖外部参考界面。当前 GUI 采用浅色大圆角扁平风格：纯色背景、白色卡片、浅灰指标块、蓝色状态、红色停止操作；不使用渐变。左侧为实时前视画面，右侧为任务状态、核心性能指标、巡航进度、检测目标和停止操作。
 
-右侧面板自上而下包含：状态卡（状态和相机提示）、性能指标 2×3 网格（采集 FPS、取图耗时、推理 FPS、YOLO 耗时、GUI FPS、相机/检测丢帧）、巡航进度卡（进度条 + 圈数/航点文本 + 航点路线图）、检测目标卡（固定高度滚动列表）和操作卡（停止任务）。AirSim 就绪后自动开始巡航，停止任务会安全降落并结束本次任务。当前不再使用独立的“紧凑模式”或底部状态栏；右侧面板始终是主控制区域。窗口初始尺寸默认 `1600×900`，由 `--display-width` 和 `--display-height` 控制。
+右侧面板自上而下包含：顶部应用栏（任务标题和实时任务标识）、状态卡（状态和相机提示）、性能指标 2×3 网格（采集 FPS、取图耗时、推理 FPS、YOLO 耗时、GUI FPS、相机/检测丢帧）、巡航进度卡（进度条 + 圈数/航点文本 + 航点路线图）、检测目标卡（按类别聚合的独立目标卡片）和操作卡（停止任务）。AirSim 就绪后自动开始巡航，停止任务会安全降落并结束本次任务。当前不再使用独立的“紧凑模式”或底部状态栏；右侧面板始终是主控制区域。窗口初始尺寸默认 `1600×900`，由 `--display-width` 和 `--display-height` 控制。
 
 ## 4. 运行环境
 
@@ -81,7 +83,7 @@
 - NVIDIA GeForce RTX 4060 Laptop GPU；
 - CUDA 12.6 对应的 PyTorch；
 - AirSim；
-- OpenCV、NumPy、Pillow、Ultralytics、PyQt6。
+- OpenCV、NumPy、Ultralytics、PyQt6、PyQt-Fluent-Widgets。
 
 安装依赖：
 
@@ -155,7 +157,7 @@ python simu.py --model yolov5s-visdrone.pt --device 0
 
 `--imgsz` 是 YOLO 推理尺寸，不是 AirSim 相机采集尺寸。默认推理尺寸为 640；不要为了提高速度而把 AirSim 原始帧改成 256×144 后再推理。
 
-CUDA 设备会自动使用 FP16；`--half` 可显式表达这一意图，CPU 会自动回退 FP32。模型加载后会用代表性的 1280×720 空帧预热一次，预热不计入实时检测 FPS；结束摘要会同时打印模型加载时间、预热时间和真实首帧推理时间。可用 `--imgsz 416` 降低延迟，`--imgsz 640` 保持默认检测效果，`--imgsz 768` 适合更重视小目标的测试。
+CUDA 设备会自动使用 FP16；`--half` 仅为兼容旧命令（CUDA 上默认即 FP16），`--no-half` 可强制 FP32，CPU 会自动回退 FP32。模型加载后会用代表性的 1280×720 空帧预热一次，预热不计入实时检测 FPS；结束摘要会同时打印模型加载时间、预热时间和真实首帧推理时间。可用 `--imgsz 416` 降低延迟，`--imgsz 640` 保持默认检测效果，`--imgsz 768` 适合更重视小目标的测试。模型后端可用 `--backend auto|yolov5|ultralytics` 显式指定（`auto` 按文件名推断：含 "yolov5" 走 Torch Hub）。
 
 VisDrone 权重常见类别为：
 
@@ -227,7 +229,7 @@ YOLO 检测线程
     └─ 取最新帧 → 推理 → 最新检测结果
 
 PyQt6 GUI 主线程
-    └─ 取最新显示帧 → 限频 PIL 绘制 → QLabel / 限频 QApplication.processEvents
+    └─ 取最新显示帧 → 限频 QPainter 绘制 → VideoWidget / 限频 QApplication.processEvents
 ```
 
 队列大小刻意设为 1，并且新帧会覆盖旧帧。这是为了降低延迟：实时画面宁可丢弃旧帧，也不能让检测线程处理几秒前的画面。
@@ -240,7 +242,7 @@ PyQt6 GUI 主线程
 - 取图 FPS：最近约 3 秒的成功采集帧率，同时保留总平均 FPS；
 - YOLO 平均耗时：最近 120 次真实推理样本；最大耗时：本次运行累计最大值；
 - 检测结果延迟：从帧提交检测队列到推理完成；
-- GUI 渲染平均/最大耗时：PIL 画布、检测框、HUD 和 QPixmap 更新；
+- GUI 渲染平均/最大耗时：QPainter 视频控件、检测框、HUD 和面板更新；
 - 相机/检测丢帧：最新帧覆盖队列的累计丢弃数量。
 
 默认 GUI `--display-fps 18`，不会降低相机采集或 YOLO 队列提交频率；如果只做采集基准，可使用 `--no-display`，并对比结束摘要中的分项统计。
@@ -296,9 +298,12 @@ AirSim 使用 NED 坐标系：
 | 参数 | 默认值 | 说明 |
 |---|---:|---|
 | `--model` | `visdrone-yolov26l.pt` | 模型路径 |
+| `--backend` | `auto` | 模型后端：`auto` 按文件名推断；`yolov5` 走 Torch Hub；`ultralytics` 走新版 |
 | `--conf` | `0.35` | 置信度阈值 |
 | `--iou` | `0.45` | NMS IoU 阈值 |
 | `--imgsz` | `640` | YOLO 推理尺寸 |
+| `--no-half` | 关闭 | 强制 FP32 推理（即使 CUDA 可用） |
+| `--log-file` | 无 | 将终端输出同时追加写入指定文件 |
 | `--camera` | `0` | AirSim 相机名称 |
 | `--loops` | `1` | 巡航圈数，`0` 表示持续巡航 |
 | `--poll-interval` | `0.10` | 飞行遥测轮询间隔 |
@@ -359,7 +364,7 @@ python simu.py --device 0 --save-every 30
 推荐的最小验证：
 
 ```powershell
-python -m py_compile simu.py flight.py capture.py detector.py ui_qt.py performance.py benchmark_capture.py
+python -m py_compile simu.py flight.py capture.py detector.py ui_qt.py ui_theme.py ui_components.py performance.py benchmark_capture.py
 ```
 
 如果改动涉及完整依赖，再运行：

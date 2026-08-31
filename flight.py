@@ -140,10 +140,8 @@ def get_position(client: airsim.MultirotorClient) -> tuple[float, float, float]:
 def poll_flight(
     client: airsim.MultirotorClient,
     target: Waypoint,
-    ui: dict[str, Any],
-    state_lock: threading.Lock,
 ) -> float:
-    """Fetch telemetry, refresh the display state, and return target distance."""
+    """Fetch telemetry and return the target distance in meters."""
     state = client.getMultirotorState()
     position = state.kinematics_estimated.position
     x, y, z = float(position.x_val), float(position.y_val), float(position.z_val)
@@ -306,7 +304,7 @@ def fly_to_leg(
                     raise RuntimeError(message)
 
         try:
-            distance = poll_flight(client, target, ui, state_lock)
+            distance = poll_flight(client, target)
         except Exception as exc:
             consecutive_rpc_errors += 1
             with state_lock:
@@ -352,7 +350,7 @@ def fly_to_leg(
             if stop_event.is_set() or ui["stop_cruise"].is_set():
                 break
             try:
-                poll_flight(client, target, ui, state_lock)
+                poll_flight(client, target)
             except Exception:
                 pass  # 悬停期间遥测失败不打断 dwell
             time.sleep(max(0.0, args.poll_interval))
